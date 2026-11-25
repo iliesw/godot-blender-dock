@@ -2,7 +2,13 @@
 
 Run the real Blender inside the Godot 4.7 editor (Windows), with a live two-way link: what you model in Blender appears in your Godot scene as you work.
 
-![icon](media/icon.png)
+<img src="media/icon.png" width="96" alt="Blender Dock icon">
+
+![Blender docked under Godot's 3D view, preview mode](media/screenshot_preview.png)
+
+| Scene Nodes mode: selection synced both ways | Blender as a main-screen tab |
+|---|---|
+| ![Scene Nodes](media/screenshot_scene_nodes.png) | ![Blender tab](media/screenshot_blender_tab.png) |
 
 ## Features
 - **Blender inside Godot**:

@@ -11,3 +11,4 @@ extension_api.json
 tests/sandbox/
 ~*.dll
 dist/
+media/icon_work/

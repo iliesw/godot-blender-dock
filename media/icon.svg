@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+<title>Blender Dock</title>
+<rect width="256" height="256" rx="56" fill="#1E2330"/>
+<g transform="translate(-6 -6)">
+<rect x="44" y="44" width="120" height="120" rx="32" fill="none" stroke="#4B93C9" stroke-width="24"/>
+<path d="M117.8 181.5 A52 52 0 0 1 120.9 146" fill="none" stroke="#1E2330" stroke-width="44"/>
+<circle cx="168" cy="168" r="52" fill="none" stroke="#F08A1C" stroke-width="24"/>
+<path d="M164 94 V138" stroke="#1E2330" stroke-width="44"/>
+<path d="M164 88 V144" stroke="#4B93C9" stroke-width="24"/>
+</g>
+</svg>
