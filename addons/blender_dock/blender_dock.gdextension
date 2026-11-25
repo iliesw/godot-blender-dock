@@ -1,0 +1,9 @@
+[configuration]
+
+entry_symbol = "blender_dock_init"
+compatibility_minimum = "4.7"
+reloadable = false
+
+[libraries]
+
+windows.editor.x86_64 = "res://addons/blender_dock/bin/blender_dock.windows.editor.x86_64.dll"
