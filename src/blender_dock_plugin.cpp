@@ -3,6 +3,7 @@
 #include "win_embed.h"
 
 #include <godot_cpp/classes/camera3d.hpp>
+#include <godot_cpp/classes/center_container.hpp>
 #include <godot_cpp/classes/dir_access.hpp>
 #include <godot_cpp/classes/display_server.hpp>
 #include <godot_cpp/classes/editor_interface.hpp>
@@ -261,6 +262,23 @@ void BlenderDockPlugin::_build_panel(Panel &p) {
 	p.placeholder->set_autowrap_mode(TextServer::AUTOWRAP_WORD_SMART);
 	p.placeholder->set_modulate(Color(1, 1, 1, 0.5));
 	p.host->add_child(p.placeholder);
+
+	CenterContainer *center = memnew(CenterContainer);
+	center->set_anchors_and_offsets_preset(Control::PRESET_FULL_RECT);
+	center->hide();
+	VBoxContainer *box = memnew(VBoxContainer);
+	box->set_custom_minimum_size(Vector2(320, 0));
+	center->add_child(box);
+	p.loading_label = memnew(Label);
+	p.loading_label->set_horizontal_alignment(HORIZONTAL_ALIGNMENT_CENTER);
+	box->add_child(p.loading_label);
+	p.loading_bar = memnew(ProgressBar);
+	p.loading_bar->set_min(0);
+	p.loading_bar->set_max(100);
+	p.loading_bar->set_custom_minimum_size(Vector2(320, 0));
+	box->add_child(p.loading_bar);
+	p.host->add_child(center);
+	p.loading = center;
 }
 
 void BlenderDockPlugin::_build_settings() {
@@ -346,8 +364,11 @@ void BlenderDockPlugin::_enter_tree() {
 	if (icon.is_valid()) {
 		dock->set_dock_icon(icon);
 	}
+	dock->set_closable(false); // always keep the "Blender" tab in its slot (it can still be collapsed)
 	dock->add_child(dock_panel.root);
 	add_dock(dock);
+	// A layout saved while the dock was closed would otherwise hide it for good.
+	callable_mp(dock, &EditorDock::open).call_deferred();
 
 	file_dialog = memnew(EditorFileDialog);
 	file_dialog->set_file_mode(EditorFileDialog::FILE_MODE_OPEN_FILE);
@@ -396,13 +417,24 @@ void BlenderDockPlugin::_exit_tree() {
 	if (sel && sel->is_connected("selection_changed", Callable(this, "_on_selection_changed"))) {
 		sel->disconnect("selection_changed", Callable(this, "_on_selection_changed"));
 	}
-	// Leave Blender running as a normal window: never risk unsaved work.
-	embed->detach();
+	// Close together: Blender saves its file (like Ctrl+S) and quits with the editor.
+	// Without a live link Blender cannot be told to save, so it is handed back as a normal
+	// window instead (never risk unsaved work).
+	if (embed->is_running() && link.is_valid() && link->is_peer_connected()) {
+		embed->release_for_quit();
+		String path = _default_blend_path();
+		if (link->get_blend_file().is_empty()) {
+			ensure_ignored_dir(ProjectSettings::get_singleton()->localize_path(path.get_base_dir()));
+		}
+		if (!link->send_save_quit(path, 2000)) {
+			// Blender did not confirm: its watchdog will pop it out as a normal window (nothing lost).
+			UtilityFunctions::print("Blender Dock: Blender will be shown as a normal window instead.");
+		}
+	} else {
+		UtilityFunctions::print("Blender Dock: no live link at exit; handing Blender back as a normal window.");
+		embed->detach();
+	}
 	if (link.is_valid()) {
-		Dictionary d;
-		d["t"] = "chrome";
-		d["docked"] = false;
-		link->send(d);
 		link->stop();
 		link.unref();
 	}
@@ -533,8 +565,8 @@ void BlenderDockPlugin::_update_ui() {
 		String ph;
 		if (!running) {
 			ph = "Blender is not running.\nPress \"Launch\".";
-		} else if (!window) {
-			ph = "Starting Blender...";
+		} else if (!blender_ready) {
+			ph = ""; // progress bar shows instead
 		} else if (popped_out) {
 			ph = "Blender is in its own window.\nPress \"Dock\" to bring it back.";
 		} else if (p->host != active) {
@@ -543,6 +575,91 @@ void BlenderDockPlugin::_update_ui() {
 		p->placeholder->set_text(ph);
 		p->placeholder->set_visible(!ph.is_empty());
 	}
+}
+
+// Real startup stages, smoothed so the bar keeps moving inside a stage:
+//   launched 0-30%  -> window exists 30-60% -> add-on connected 60-90% -> scene synced 100%.
+void BlenderDockPlugin::_update_startup(double p_delta) {
+	bool running = embed->is_running();
+	if (!running) {
+		blender_ready = false;
+		window_elapsed = -1.0;
+		launch_elapsed = 0.0;
+		loading_value = 0.0;
+	}
+	bool show = running && !blender_ready;
+	if (show) {
+		launch_elapsed += p_delta;
+		bool window = embed->has_window();
+		if (window && window_elapsed < 0.0) {
+			window_elapsed = 0.0;
+		}
+		if (window_elapsed >= 0.0) {
+			window_elapsed += p_delta;
+		}
+		bool connected = link.is_valid() && link->is_peer_connected();
+		double floor_v, cap;
+		if (!window) {
+			loading_text = "Starting Blender...";
+			floor_v = 0.0;
+			cap = 30.0;
+		} else if (!connected) {
+			loading_text = "Loading Blender...";
+			floor_v = 30.0;
+			cap = 60.0;
+		} else {
+			loading_text = "Syncing scene...";
+			floor_v = 60.0;
+			cap = 90.0;
+		}
+		// Ease toward the stage cap (never reaching it until the stage really completes).
+		loading_value = MAX(loading_value, floor_v);
+		loading_value += (cap - loading_value) * MIN(1.0, p_delta * 1.2);
+		if (connected && link->has_scene()) {
+			blender_ready = true; // fully loaded and synced: reveal Blender
+		} else if (window_elapsed > 25.0) {
+			blender_ready = true; // add-on never connected: show Blender anyway rather than hang
+			last_error = "Blender started, but the Godot link did not connect (check the Blender console).";
+		}
+		if (blender_ready) {
+			loading_value = 100.0;
+			embed->set_hold_hidden(false); // revealed by the normal embed/visibility path next frame
+		}
+	}
+	for (Panel *p : { &main_panel, &dock_panel }) {
+		if (!p->loading) {
+			continue;
+		}
+		p->loading->set_visible(show && !blender_ready);
+		if (show) {
+			p->loading_label->set_text(loading_text);
+			p->loading_bar->set_value(loading_value);
+		}
+	}
+}
+
+EmbedRect BlenderDockPlugin::_launch_rect() {
+	// Blender's -p takes x from the left and y from the BOTTOM of the screen. Starting it at the
+	// panel position (and behind Godot, --no-window-focus) means it is never seen elsewhere.
+	Control *host = _active_host();
+	if (!host) {
+		host = main_panel.host;
+	}
+	Vector2 pos = host->get_screen_position();
+	Vector2 size = host->get_size();
+	if (size.x < 64 || size.y < 64) {
+		Window *w = host->get_window();
+		pos = Vector2(w->get_position()) + Vector2(64, 64);
+		size = Vector2(800, 600);
+	}
+	DisplayServer *ds = DisplayServer::get_singleton();
+	Rect2i usable = ds->screen_get_usable_rect(ds->window_get_current_screen());
+	EmbedRect r;
+	r.x = int(pos.x);
+	r.w = int(size.x);
+	r.h = int(size.y);
+	r.y = MAX(0, usable.position.y + usable.size.y - int(pos.y + size.y));
+	return r;
 }
 
 // ---------------------------------------------------------------------------- loop
@@ -595,7 +712,7 @@ void BlenderDockPlugin::_process_inner(double p_delta) {
 	// Giving Blender the keyboard sends Godot a focus-out, and Godot then throttles the editor to
 	// its "unfocused" rate (10 fps by default) until the window is re-activated, which never
 	// happens for a child window. Keep normal pacing whenever Godot's own window is in front.
-	if (embed->is_embedded() && this_process_is_foreground()) {
+	if (embed->is_embedded() && (this_process_is_foreground() || embed->blender_has_focus())) {
 		Ref<EditorSettings> es = EditorInterface::get_singleton()->get_editor_settings();
 		int focused_usec = es->has_setting("interface/editor/low_processor_mode_sleep_usec")
 				? int(es->get_setting("interface/editor/low_processor_mode_sleep_usec"))
@@ -620,11 +737,10 @@ void BlenderDockPlugin::_process_inner(double p_delta) {
 	}
 
 	if (embed->is_running()) {
-		find_cooldown -= p_delta;
-		if (!embed->has_window() && find_cooldown <= 0.0) {
-			find_cooldown = 0.1;
-			embed->find_window();
+		if (!embed->has_window()) {
+			embed->find_window(); // every frame while starting: hide it the moment it appears
 		}
+		embed->enforce_hold();
 		if (embed->has_window() && !popped_out) {
 			Control *host = _active_host();
 			Vector2 size = host ? host->get_size() : Vector2();
@@ -632,7 +748,12 @@ void BlenderDockPlugin::_process_inner(double p_delta) {
 					host->get_window()->get_mode() != Window::MODE_MINIMIZED) {
 				int64_t parent = DisplayServer::get_singleton()->window_get_native_handle(
 						DisplayServer::WINDOW_HANDLE, host->get_window()->get_window_id());
-				embed->embed(intptr_t(parent));
+				// Restyling / re-owning another process's window is synchronous with its UI thread.
+				// Only do it once Blender is loaded and has just answered a probe, so Godot never waits.
+				if (blender_ready && (embed->parent() != intptr_t(parent) || !embed->is_embedded()) &&
+						embed->is_responsive()) {
+					embed->embed(intptr_t(parent));
+				}
 				Vector2 pos = host->get_screen_position();
 				EmbedRect r;
 				r.x = int(std::floor(pos.x));
@@ -661,6 +782,8 @@ void BlenderDockPlugin::_process_inner(double p_delta) {
 		}
 		_send_chrome();
 	}
+
+	_update_startup(p_delta);
 
 	if (follow_view) {
 		_follow_view();
@@ -843,7 +966,9 @@ void BlenderDockPlugin::_launch(const String &p_blend) {
 	if (!p_blend.is_empty()) {
 		args += quote(p_blend) + " ";
 	}
-	args += "--no-window-focus --python " + quote(ps->globalize_path(SCRIPT_PATH)) + " --";
+	EmbedRect lr = _launch_rect();
+	args += vformat("--no-window-focus -p %d %d %d %d ", lr.x, lr.y, lr.w, lr.h);
+	args += "--python " + quote(ps->globalize_path(SCRIPT_PATH)) + " --";
 	args += " --godot-port " + itos(int(_setting(S_PORT, 6789)));
 	args += " --godot-pid " + itos(OS::get_singleton()->get_process_id());
 	args += " --godot-project " + quote(ps->globalize_path("res://").trim_suffix("/"));
@@ -868,6 +993,11 @@ void BlenderDockPlugin::_launch(const String &p_blend) {
 
 	std::wstring err;
 	popped_out = false;
+	blender_ready = false;
+	window_elapsed = -1.0;
+	launch_elapsed = 0.0;
+	loading_value = 0.0;
+	embed->set_hold_hidden(true);
 	if (!embed->launch(to_w(exe), to_w(args), to_w(exe.get_base_dir()), err)) {
 		last_error = "Could not start Blender: " + from_w(err).strip_edges();
 	}

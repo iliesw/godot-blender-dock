@@ -12,12 +12,14 @@
 #include <godot_cpp/classes/editor_plugin.hpp>
 #include <godot_cpp/classes/label.hpp>
 #include <godot_cpp/classes/line_edit.hpp>
+#include <godot_cpp/classes/progress_bar.hpp>
 #include <godot_cpp/classes/spin_box.hpp>
 #include <godot_cpp/classes/v_box_container.hpp>
 
 #include <memory>
 
 class WinEmbed;
+struct EmbedRect;
 
 namespace godot {
 
@@ -58,6 +60,9 @@ private:
 		CheckBox *sync = nullptr;
 		CheckBox *follow = nullptr;
 		Label *status = nullptr;
+		Control *loading = nullptr; // startup progress, shown over the host
+		Label *loading_label = nullptr;
+		ProgressBar *loading_bar = nullptr;
 	};
 
 	struct SettingsUI {
@@ -119,6 +124,14 @@ private:
 	bool sync_enabled = true;
 	bool follow_view = false;
 	bool pending_auto_link = false;
+	// Startup: Blender stays hidden until it has loaded and synced; the panels show progress.
+	bool blender_ready = false;
+	double launch_elapsed = 0.0;
+	double window_elapsed = -1.0;
+	double loading_value = 0.0;
+	String loading_text;
+	void _update_startup(double p_delta);
+	EmbedRect _launch_rect();
 	bool tab_icon_fixed = false;
 	bool chrome_sent_docked = false;
 	intptr_t embedded_sent_parent = 0;

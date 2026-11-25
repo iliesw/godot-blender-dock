@@ -51,6 +51,7 @@ public:
 	bool is_listening() const { return server.is_valid() && server->is_listening(); }
 	bool is_peer_connected() const;
 	bool take_just_connected();
+	bool has_scene() const { return scene_received; }
 	int get_port() const { return port; }
 	int get_object_count() const { return objects.size(); }
 	String get_blend_file() const { return blend_file; }
@@ -61,6 +62,8 @@ public:
 	Node3D *get_link_root();
 
 	void send(const Dictionary &p_header);
+	// Editor shutdown: send save_quit and block (up to p_timeout_ms) until Blender acknowledges.
+	bool send_save_quit(const String &p_path, int p_timeout_ms);
 
 	// Two-way helpers driven by the plugin.
 	void on_editor_selection_changed();
@@ -109,6 +112,8 @@ private:
 	Ref<StreamPeerTCP> peer;
 	int port = 6789;
 	bool just_connected = false;
+	bool scene_received = false;
+	bool bye_received = false;
 
 	PackedByteArray inbuf;
 	int64_t inbuf_off = 0;

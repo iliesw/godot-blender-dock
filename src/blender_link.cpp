@@ -20,6 +20,7 @@
 #include <godot_cpp/classes/shape3d.hpp>
 #include <godot_cpp/classes/spot_light3d.hpp>
 #include <godot_cpp/classes/static_body3d.hpp>
+#include <godot_cpp/classes/os.hpp>
 #include <godot_cpp/classes/time.hpp>
 #include <godot_cpp/core/object.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
@@ -157,6 +158,28 @@ void BlenderLink::send(const Dictionary &p_header) {
 	peer->put_data(out);
 }
 
+bool BlenderLink::send_save_quit(const String &p_path, int p_timeout_ms) {
+	if (!is_peer_connected()) {
+		return false;
+	}
+	bye_received = false;
+	Dictionary d;
+	d["t"] = "save_quit";
+	d["path"] = p_path;
+	send(d);
+	uint64_t until = now_ms() + p_timeout_ms;
+	while (now_ms() < until && !bye_received && peer.is_valid()) {
+		peer->poll();
+		if (peer->get_status() != StreamPeerTCP::STATUS_CONNECTED) {
+			break;
+		}
+		_read_peer();
+		OS::get_singleton()->delay_msec(10);
+	}
+	UtilityFunctions::print("Blender Dock: save_quit ", bye_received ? "acknowledged" : "NOT acknowledged");
+	return bye_received;
+}
+
 void BlenderLink::poll(bool p_sync_enabled) {
 	bool was_enabled = sync_enabled;
 	sync_enabled = p_sync_enabled;
@@ -172,6 +195,7 @@ void BlenderLink::poll(bool p_sync_enabled) {
 			inbuf.clear();
 			inbuf_off = 0;
 			just_connected = true;
+			scene_received = false;
 			last_sel.clear();
 			Dictionary d;
 			d["t"] = "sync";
@@ -287,6 +311,8 @@ void BlenderLink::_handle_frame(const Dictionary &h, const uint8_t *blob, int64_
 			notice = "Bake failed: " + String(h.get("msg", "unknown error"));
 		}
 		UtilityFunctions::print("Blender Dock: ", notice);
+	} else if (t == "bye") {
+		bye_received = true;
 	} else if (t == "hello") {
 		blend_file = h.get("file", "");
 		UtilityFunctions::print("Blender Dock: linked to Blender ", h.get("blender", ""), " ",
@@ -502,6 +528,7 @@ void BlenderLink::_on_instances(const Dictionary &h, const uint8_t *blob, int64_
 }
 
 void BlenderLink::_on_scene(const Dictionary &h) {
+	scene_received = true;
 	auto to_set = [](const Array &a) {
 		HashSet<String> s;
 		for (int i = 0; i < a.size(); i++) {

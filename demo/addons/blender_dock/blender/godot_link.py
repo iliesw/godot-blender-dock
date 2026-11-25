@@ -91,9 +91,22 @@ class Link:
     hwnd = 0
     parent_hwnd = 0
     godot_died = False
+    quitting = False
 
 
 L = Link()
+
+
+LOG_PATH = os.path.join(tempfile.gettempdir(), "blender_dock_link.log")
+
+
+def _log(msg):
+    """Blender runs without a console here: keep a small log for troubleshooting."""
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%H:%M:%S ") + str(msg) + "\n")
+    except OSError:
+        pass
 
 
 def _frame(header, blob=b""):
@@ -173,13 +186,14 @@ def _run_op(fn):
 def _read_commands():
     if not L.sock:
         return
+    closed = False
     try:
         L.sock.setblocking(False)
         while True:
             chunk = L.sock.recv(1 << 16)
             if not chunk:
-                _disconnect()
-                return
+                closed = True  # Godot closed the link: still run what it sent last (save_quit)
+                break
             L.rx += chunk
     except (BlockingIOError, InterruptedError):
         pass
@@ -203,6 +217,8 @@ def _read_commands():
             _handle_command(header)
         except Exception as e:
             print("[godot_link] command failed:", header.get("t"), e)
+    if closed:
+        _disconnect()
 
 
 def _handle_command(h):
@@ -217,6 +233,11 @@ def _handle_command(h):
         _save(h.get("path", ""))
     elif t == "quit":
         _run_op(lambda: bpy.ops.wm.quit_blender())
+    elif t == "save_quit":
+        L.quitting = True  # set first: the watchdog must not rescue the window
+        _send({"t": "bye"})
+        _log("save_quit received")
+        _save_quit(h.get("path", ""))
     elif t == "sel":
         _apply_selection(h.get("names", []), h.get("active", ""))
     elif t == "xform":
@@ -242,6 +263,21 @@ def _save(path):
             bpy.ops.wm.save_as_mainfile(filepath=path)
     _run_op(do)
     _hello()
+
+
+def _save_quit(path):
+    """Godot is closing: save the .blend and quit with it. On failure, show Blender instead."""
+    L.quitting = True
+    try:
+        _save(path)
+    except Exception as e:
+        print("[godot_link] save before quit failed:", e)
+        L.quitting = False
+        _rescue_window()
+        return
+    _clear_recovery()
+    _log("saved, quitting")
+    _run_op(lambda: bpy.ops.wm.quit_blender())
 
 
 def _apply_selection(names, active):
@@ -767,6 +803,7 @@ def _selection_state():
 def _tick():
     try:
         _try_connect()
+        _allow_godot_foreground()
         _apply_chrome()
         _recovery_tick()
         if not L.sock:
@@ -929,6 +966,15 @@ def _clear_recovery():
 atexit.register(_clear_recovery)  # clean exit -> nothing to recover
 
 
+def _allow_godot_foreground():
+    """Let the Godot editor take the foreground back (focus follows mouse) while Blender is in front."""
+    if os.name == "nt" and GODOT_PID:
+        try:
+            ctypes.windll.user32.AllowSetForegroundWindow(GODOT_PID)
+        except Exception:
+            pass
+
+
 def _watchdog():
     """Background thread: if Godot dies, rescue Blender's window before it is taken down."""
     if os.name != "nt" or not GODOT_PID:
@@ -944,16 +990,34 @@ def _watchdog():
             break
         if L.parent_hwnd and L.hwnd and not u32.IsWindow(ctypes.c_void_p(L.parent_hwnd)):
             break
+    if L.quitting:
+        return  # normal editor close: Blender saves and quits by itself
+    for _ in range(20):  # a save_quit may still be on its way (up to 2 s)
+        time.sleep(0.1)
+        if L.quitting:
+            return
+    _log("Godot exited without save_quit: rescuing window and writing recovery copy")
+    _rescue_window()
+    L.docked = False
+    L.godot_died = True  # main-thread tick writes the recovery copy (bpy is not thread-safe)
+
+
+def _rescue_window():
+    """Make Blender a normal, visible top-level window again."""
+    if os.name != "nt":
+        return
+    u32 = ctypes.windll.user32
     if L.hwnd and u32.IsWindow(ctypes.c_void_p(L.hwnd)):
         GWL_STYLE = -16
         WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_CHILD = 0x00CF0000, 0x10000000, 0x40000000
         h = ctypes.c_void_p(L.hwnd)
+        GWLP_HWNDPARENT, GWL_EXSTYLE, WS_EX_TOOLWINDOW, WS_POPUP = -8, -20, 0x00000080, 0x80000000
+        u32.SetWindowLongPtrW(h, GWLP_HWNDPARENT, None)  # drop the dead Godot owner
+        u32.SetWindowLongW(h, GWL_EXSTYLE, ctypes.c_long(u32.GetWindowLongW(h, GWL_EXSTYLE) & ~WS_EX_TOOLWINDOW).value)
         u32.SetParent(h, None)
-        style = (u32.GetWindowLongW(h, GWL_STYLE) & ~WS_CHILD) | WS_OVERLAPPEDWINDOW | WS_VISIBLE
-        u32.SetWindowLongW(h, GWL_STYLE, style)
+        style = (u32.GetWindowLongW(h, GWL_STYLE) & 0xFFFFFFFF & ~(WS_CHILD | WS_POPUP)) | WS_OVERLAPPEDWINDOW | WS_VISIBLE
+        u32.SetWindowLongW(h, GWL_STYLE, ctypes.c_long(style & 0xFFFFFFFF).value)
         u32.SetWindowPos(h, None, 100, 100, 1280, 800, 0x0020 | 0x0040)  # FRAMECHANGED | SHOWWINDOW
-    L.docked = False
-    L.godot_died = True  # main-thread tick writes the recovery copy (bpy is not thread-safe)
 
 
 # --------------------------------------------------------------------------- look & feel

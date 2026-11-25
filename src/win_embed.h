@@ -3,7 +3,9 @@
 // window as a borderless child, keep it positioned, and juggle keyboard focus.
 // Deliberately free of Godot headers so <windows.h> never meets godot-cpp macros.
 
+#include <atomic>
 #include <cstdint>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -38,8 +40,17 @@ public:
 	intptr_t parent() const { return parent_; }
 	// True while Blender's UI thread is not answering (long operation / freeze).
 	bool is_blender_busy() const { return busy_; }
+	// True when Blender answered the latest probe: synchronous window calls will not stall Godot.
+	bool is_responsive();
 
 	void embed(intptr_t parent_hwnd);
+	// Keep Blender's window hidden (startup: until it has loaded and synced).
+	void set_hold_hidden(bool p_hold);
+	bool is_held_hidden() const { return hold_hidden_; }
+	void enforce_hold(); // re-hide if Blender showed itself while held
+	// Editor shutdown: hide Blender and drop the Godot owner so closing Godot cannot destroy
+	// Blender's window before Blender has saved and quit by itself.
+	void release_for_quit();
 	void detach();
 	void set_rect(const EmbedRect &screen_rect);
 	void set_visible(bool visible);
@@ -72,6 +83,13 @@ private:
 	uint64_t godot_hover_since_ = 0;
 	bool prev_buttons_ = false;
 	bool pending_click_ = false;
+	std::atomic<bool> hold_hidden_{ false };
+	// Hides Blender's windows from a background thread while held, so it never flashes even
+	// while the Godot editor itself is busy (startup, imports) and not running plugin code.
+	std::thread hold_thread_;
+	std::atomic<bool> hold_thread_run_{ false };
+	void start_hold_thread();
+	void stop_hold_thread();
 	bool busy_ = false;
 	// Non-blocking hang probe: WM_NULL via SendMessageCallback, answered on Godot's message pump.
 	uint64_t probe_sent_ = 0;

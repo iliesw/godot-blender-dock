@@ -25,8 +25,8 @@ BOOL CALLBACK enum_proc(HWND h, LPARAM lp) {
 	FindCtx *ctx = reinterpret_cast<FindCtx *>(lp);
 	DWORD pid = 0;
 	GetWindowThreadProcessId(h, &pid);
-	if (pid != ctx->pid || !IsWindowVisible(h) || GetWindow(h, GW_OWNER) != nullptr) {
-		return TRUE;
+	if (pid != ctx->pid || GetWindow(h, GW_OWNER) != nullptr) {
+		return TRUE; // hidden windows count: startup keeps Blender hidden until it is ready
 	}
 	wchar_t cls[64] = {};
 	GetClassNameW(h, cls, 64);
@@ -112,7 +112,51 @@ bool extract_exe_icon_rgba(const std::wstring &exe, int size, std::vector<uint8_
 	return ok;
 }
 
+namespace {
+struct HideCtx {
+	DWORD pid;
+};
+
+BOOL CALLBACK hide_proc(HWND h, LPARAM lp) {
+	DWORD pid = 0;
+	GetWindowThreadProcessId(h, &pid);
+	if (pid == reinterpret_cast<HideCtx *>(lp)->pid && IsWindowVisible(h)) {
+		wchar_t cls[64] = {};
+		GetClassNameW(h, cls, 64);
+		if (wcscmp(cls, L"GHOST_WindowClass") == 0) {
+			ShowWindowAsync(h, SW_HIDE);
+		}
+	}
+	return TRUE;
+}
+} // namespace
+
+void WinEmbed::start_hold_thread() {
+	stop_hold_thread();
+	hold_thread_run_ = true;
+	DWORD pid = pid_;
+	HANDLE proc = process_;
+	hold_thread_ = std::thread([this, pid, proc]() {
+		HideCtx ctx = { pid };
+		while (hold_thread_run_ && hold_hidden_) {
+			if (WaitForSingleObject(proc, 0) != WAIT_TIMEOUT) {
+				break; // Blender exited
+			}
+			EnumWindows(hide_proc, reinterpret_cast<LPARAM>(&ctx));
+			Sleep(4);
+		}
+	});
+}
+
+void WinEmbed::stop_hold_thread() {
+	hold_thread_run_ = false;
+	if (hold_thread_.joinable()) {
+		hold_thread_.join();
+	}
+}
+
 WinEmbed::~WinEmbed() {
+	stop_hold_thread();
 	// Never leave Blender parented to a window that is about to die: that would destroy
 	// Blender's main window and lose unsaved work. Hand it back as a normal window.
 	detach();
@@ -156,6 +200,9 @@ bool WinEmbed::launch(const std::wstring &exe, const std::wstring &args, const s
 	CloseHandle(pi.hThread);
 	process_ = pi.hProcess;
 	pid_ = pi.dwProcessId;
+	if (hold_hidden_) {
+		start_hold_thread();
+	}
 	return true;
 }
 
@@ -167,16 +214,13 @@ void WinEmbed::terminate() {
 	if (is_running()) {
 		TerminateProcess(process_, 0);
 	}
-	attach_input(false);
 	hwnd_ = 0;
 	embedded_ = false;
 }
 
 bool WinEmbed::has_window() {
 	if (hwnd_ && !IsWindow(H(hwnd_))) {
-		// Blender recreated or closed its main window.
-		attach_input(false);
-		hwnd_ = 0;
+		hwnd_ = 0; // Blender recreated or closed its main window
 		embedded_ = false;
 	}
 	return hwnd_ != 0;
@@ -198,9 +242,61 @@ bool WinEmbed::find_window() {
 	blender_thread_ = GetWindowThreadProcessId(ctx.best, nullptr);
 	orig_style_ = GetWindowLongW(ctx.best, GWL_STYLE);
 	orig_exstyle_ = GetWindowLongW(ctx.best, GWL_EXSTYLE);
+	if (hold_hidden_) {
+		ShowWindowAsync(ctx.best, SW_HIDE); // first frame it exists: hide before it is noticed
+		visible_ = false;
+	}
 	return true;
 }
 
+// Owned windows only stack above their owner once their z-order is touched; put Blender
+// directly above the Godot window (not above every other application).
+static void raise_above_owner(HWND h, HWND owner) {
+	HWND root = GetAncestor(owner, GA_ROOT);
+	HWND above = GetWindow(root, GW_HWNDPREV);
+	while (above == h) {
+		above = GetWindow(above, GW_HWNDPREV);
+	}
+	SetWindowPos(h, above ? above : HWND_TOP, 0, 0, 0, 0,
+			SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS);
+}
+
+void WinEmbed::set_hold_hidden(bool p_hold) {
+	hold_hidden_ = p_hold;
+	if (!p_hold) {
+		stop_hold_thread();
+	} else if (is_running() && !hold_thread_.joinable()) {
+		start_hold_thread();
+	}
+	if (p_hold && hwnd_ && IsWindow(H(hwnd_))) {
+		ShowWindowAsync(H(hwnd_), SW_HIDE);
+		visible_ = false;
+	}
+}
+
+void WinEmbed::enforce_hold() {
+	if (hold_hidden_ && hwnd_ && IsWindow(H(hwnd_)) && IsWindowVisible(H(hwnd_))) {
+		ShowWindowAsync(H(hwnd_), SW_HIDE);
+		visible_ = false;
+	}
+}
+
+void WinEmbed::release_for_quit() {
+	if (!has_window()) {
+		return;
+	}
+	HWND h = H(hwnd_);
+	ShowWindow(h, SW_HIDE);
+	SetWindowLongPtrW(h, GWLP_HWNDPARENT, 0);
+	embedded_ = false;
+	parent_ = 0;
+	hwnd_ = 0;
+}
+
+// Blender is NOT parented into Godot: a cross-process child window shares input with its
+// parent, and a busy Blender then freezes Godot's input. Instead it is a borderless window
+// *owned* by the Godot window: always above it, minimized with it, hidden from the taskbar and
+// Alt+Tab, kept exactly over the host panel. Each program keeps its own input queue.
 void WinEmbed::embed(intptr_t parent_hwnd) {
 	if (!has_window() || !parent_hwnd) {
 		return;
@@ -209,43 +305,31 @@ void WinEmbed::embed(intptr_t parent_hwnd) {
 		return;
 	}
 	HWND h = H(hwnd_);
-	HWND p = H(parent_hwnd);
-
-	bool had_focus = blender_has_focus();
-	if (had_focus) {
-		focus_godot();
-	}
-	attach_input(false);
-
 	if (!embedded_) {
 		if (IsZoomed(h) || IsIconic(h)) {
 			ShowWindow(h, SW_RESTORE);
 		}
 		LONG style = orig_style_;
-		style &= ~(WS_POPUP | WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_MAXIMIZE |
+		style &= ~(WS_CHILD | WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_MAXIMIZE |
 				WS_MINIMIZE);
-		style |= WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN;
+		style |= WS_POPUP | WS_CLIPSIBLINGS | WS_CLIPCHILDREN;
 		LONG ex = orig_exstyle_ & ~(WS_EX_APPWINDOW | WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE | WS_EX_DLGMODALFRAME |
 											 WS_EX_STATICEDGE | WS_EX_TOPMOST);
-		// Style must be WS_CHILD *before* SetParent (see SetParent docs).
+		ex |= WS_EX_TOOLWINDOW; // no taskbar button, no Alt+Tab entry
 		SetWindowLongW(h, GWL_STYLE, style);
 		SetWindowLongW(h, GWL_EXSTYLE, ex);
 	}
-
-	// The Godot window must not paint over its new child.
-	LONG pstyle = GetWindowLongW(p, GWL_STYLE);
-	if (!(pstyle & WS_CLIPCHILDREN)) {
-		SetWindowLongW(p, GWL_STYLE, pstyle | WS_CLIPCHILDREN);
-	}
-
-	SetParent(h, p);
+	SetWindowLongPtrW(h, GWLP_HWNDPARENT, static_cast<LONG_PTR>(parent_hwnd)); // owner, not parent
 	parent_ = parent_hwnd;
-	godot_thread_ = GetWindowThreadProcessId(p, nullptr);
+	godot_thread_ = GetWindowThreadProcessId(H(parent_hwnd), nullptr);
 	embedded_ = true;
 	last_rect_ = EmbedRect();
-	SetWindowPos(h, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED | SWP_NOACTIVATE);
-	if (visible_) {
-		ShowWindowAsync(h, SW_SHOWNA);
+	SetWindowPos(h, nullptr, 0, 0, 0, 0,
+			SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+	raise_above_owner(h, H(parent_hwnd));
+	if (visible_ && !hold_hidden_) {
+		ShowWindowAsync(h, SW_SHOWNOACTIVATE);
+		shown_at_ = GetTickCount64();
 	}
 }
 
@@ -255,19 +339,14 @@ void WinEmbed::detach() {
 		return;
 	}
 	HWND h = H(hwnd_);
-	if (blender_has_focus()) {
-		focus_godot();
-	}
-	attach_input(false);
-
 	RECT r;
 	GetWindowRect(h, &r);
-	SetParent(h, nullptr);
-	SetWindowLongW(h, GWL_STYLE, (orig_style_ & ~(WS_MAXIMIZE | WS_MINIMIZE)) | WS_VISIBLE);
+	SetWindowLongPtrW(h, GWLP_HWNDPARENT, 0);
+	SetWindowLongW(h, GWL_STYLE, (orig_style_ & ~(WS_MAXIMIZE | WS_MINIMIZE | WS_CHILD)) | WS_VISIBLE);
 	SetWindowLongW(h, GWL_EXSTYLE, orig_exstyle_);
 	int w = std::max<int>(r.right - r.left, 640);
 	int hh = std::max<int>(r.bottom - r.top, 480);
-	SetWindowPos(h, HWND_TOP, r.left, r.top, w, hh, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+	SetWindowPos(h, HWND_TOP, r.left, r.top, w, hh, SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_ASYNCWINDOWPOS);
 	SetForegroundWindow(h);
 	embedded_ = false;
 	parent_ = 0;
@@ -275,21 +354,19 @@ void WinEmbed::detach() {
 }
 
 void WinEmbed::set_rect(const EmbedRect &screen_rect) {
-	if (!embedded_ || !has_window()) {
+	if (!embedded_ || !has_window() || screen_rect == last_rect_) {
 		return;
 	}
-	if (screen_rect == last_rect_) {
-		return;
-	}
-	POINT pt = { screen_rect.x, screen_rect.y };
-	ScreenToClient(H(parent_), &pt);
 	// Async: never block the Godot editor when Blender is busy (baking, big booleans...).
-	SetWindowPos(H(hwnd_), nullptr, pt.x, pt.y, std::max(1, screen_rect.w), std::max(1, screen_rect.h),
+	SetWindowPos(H(hwnd_), nullptr, screen_rect.x, screen_rect.y, std::max(1, screen_rect.w), std::max(1, screen_rect.h),
 			SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS);
 	last_rect_ = screen_rect;
 }
 
 void WinEmbed::set_visible(bool visible) {
+	if (visible && hold_hidden_) {
+		return;
+	}
 	if (!embedded_ || !has_window()) {
 		visible_ = visible;
 		return;
@@ -301,31 +378,28 @@ void WinEmbed::set_visible(bool visible) {
 		focus_godot();
 	}
 	visible_ = visible;
-	ShowWindowAsync(H(hwnd_), visible ? SW_SHOWNA : SW_HIDE);
+	ShowWindowAsync(H(hwnd_), visible ? SW_SHOWNOACTIVATE : SW_HIDE);
 	if (visible) {
+		raise_above_owner(H(hwnd_), H(parent_));
 		shown_at_ = GetTickCount64();
 	}
 }
 
-void WinEmbed::attach_input(bool attach) {
-	if (attach == input_attached_) {
-		return;
+void WinEmbed::attach_input(bool) {
+	// Intentionally unused: input queues are never shared (see embed()).
+}
+
+static DWORD foreground_pid() {
+	HWND fg = GetForegroundWindow();
+	DWORD pid = 0;
+	if (fg) {
+		GetWindowThreadProcessId(fg, &pid);
 	}
-	if (!blender_thread_ || !godot_thread_ || blender_thread_ == godot_thread_) {
-		input_attached_ = false;
-		return;
-	}
-	if (AttachThreadInput(godot_thread_, blender_thread_, attach ? TRUE : FALSE) || !attach) {
-		input_attached_ = attach;
-	}
+	return pid;
 }
 
 bool WinEmbed::blender_has_focus() {
-	if (!embedded_ || !input_attached_ || !hwnd_) {
-		return false;
-	}
-	HWND f = GetFocus(); // shared input state while attached
-	return f && (f == H(hwnd_) || IsChild(H(hwnd_), f));
+	return embedded_ && pid_ && foreground_pid() == pid_;
 }
 
 // Global, not a member: a reply may arrive after the plugin (and its WinEmbed) is gone.
@@ -339,58 +413,39 @@ void WinEmbed::probe_responsiveness() {
 	uint64_t now = GetTickCount64();
 	probe_replied_ = g_probe_replied;
 	bool waiting = probe_sent_ > probe_replied_;
-	if (waiting) {
-		busy_ = now - probe_sent_ > 300; // no answer for 300 ms: Blender's UI thread is stuck
-	} else {
-		busy_ = false;
-	}
+	busy_ = waiting && now - probe_sent_ > 300; // status only ("Blender: busy")
 	if (!waiting && now >= next_probe_) {
-		next_probe_ = now + 200;
+		next_probe_ = now + 250;
 		probe_sent_ = now;
-		if (!SendMessageCallbackW(H(hwnd_), WM_NULL, 0, 0, reinterpret_cast<SENDASYNCPROC>(&WinEmbed::probe_reply),
-					0)) {
+		if (!SendMessageCallbackW(H(hwnd_), WM_NULL, 0, 0, reinterpret_cast<SENDASYNCPROC>(&WinEmbed::probe_reply), 0)) {
 			g_probe_replied = now;
 		}
 	}
 }
 
+bool WinEmbed::is_responsive() {
+	if (!has_window()) {
+		return false;
+	}
+	probe_responsiveness();
+	return !busy_ && probe_sent_ <= probe_replied_ && probe_replied_ != 0;
+}
+
 void WinEmbed::focus_blender() {
-	if (!embedded_ || !visible_ || !has_window()) {
+	if (!embedded_ || !visible_ || !has_window() || busy_) {
 		return;
 	}
-	// Never share input with a frozen Blender: Godot's own input would freeze with it.
-	if (busy_ || IsHungAppWindow(H(hwnd_))) {
-		return;
-	}
-	// Handing focus over is synchronous with Blender's UI thread. Wait until a freshly shown
-	// window has redrawn and Blender answered a recent probe, so Godot never stalls on it.
-	uint64_t now = GetTickCount64();
-	if (now - shown_at_ < 250 || probe_sent_ > probe_replied_) {
-		return;
-	}
-	// Share the input queue only while Blender owns the keyboard, so a busy Blender
-	// can never stall Godot's input the rest of the time.
-	attach_input(true);
-	if (!input_attached_) {
-		return;
-	}
-	SetFocus(H(hwnd_));
-	// Child windows never get WM_ACTIVATE; GHOST uses it to mark its window active.
-	PostMessageW(H(hwnd_), WM_ACTIVATE, WA_CLICKACTIVE, 0);
+	// Godot is in front, so it may hand the foreground to Blender. Normal activation:
+	// Blender gets the keyboard through its own input queue, Godot is never blocked.
+	SetForegroundWindow(H(hwnd_));
 }
 
 void WinEmbed::focus_godot() {
-	bool was_attached = input_attached_;
-	// Detach first: then SetFocus stays inside Godot's own thread and never waits on Blender.
-	attach_input(false);
 	if (!parent_) {
 		return;
 	}
-	SetFocus(H(parent_));
-	if (was_attached && hwnd_) {
-		PostMessageW(H(hwnd_), WM_KILLFOCUS, reinterpret_cast<WPARAM>(H(parent_)), 0);
-		PostMessageW(H(hwnd_), WM_ACTIVATE, WA_INACTIVE, 0);
-	}
+	// Allowed because godot_link.py calls AllowSetForegroundWindow(godot_pid) while Blender is in front.
+	SetForegroundWindow(GetAncestor(H(parent_), GA_ROOT));
 }
 
 bool WinEmbed::cursor_over_blender(int &r_x, int &r_y) {
@@ -399,52 +454,42 @@ bool WinEmbed::cursor_over_blender(int &r_x, int &r_y) {
 	r_x = pt.x;
 	r_y = pt.y;
 	HWND w = WindowFromPoint(pt);
-	return w && (w == H(hwnd_) || IsChild(H(hwnd_), w));
+	DWORD wpid = 0;
+	if (w) {
+		GetWindowThreadProcessId(w, &wpid);
+	}
+	return wpid && wpid == pid_;
 }
 
 void WinEmbed::update_focus(bool follow_mouse, bool godot_text_focused) {
 	if (!embedded_ || !visible_ || !has_window() || !parent_) {
 		return;
 	}
-	HWND top = GetAncestor(H(parent_), GA_ROOT);
-	if (GetForegroundWindow() != top) {
-		return; // another app (or a Godot dialog / Blender preferences window) is in front
-	}
-	// Hang guard: while input is shared, a frozen Blender would freeze Godot's input too.
 	probe_responsiveness();
-	if (busy_) {
-		if (input_attached_) {
-			attach_input(false); // detach first, then Godot can take its keyboard back
-			SetFocus(H(parent_));
-		}
-		return;
-	}
-
-	bool buttons = any_button_down();
-	bool pressed = buttons && !prev_buttons_;
-	prev_buttons_ = buttons;
-
-	int x, y;
-	bool over_blender = cursor_over_blender(x, y);
-	bool has = blender_has_focus();
-
-	if (over_blender) {
+	DWORD fg = foreground_pid();
+	bool godot_front = fg == GetCurrentProcessId();
+	bool blender_front = fg == pid_;
+	if (!godot_front && !blender_front) {
 		godot_hover_since_ = 0;
-		pending_click_ = pending_click_ || pressed; // focus may be deferred a few frames; keep the click
-		if (!has && (pending_click_ || (follow_mouse && !buttons && !godot_text_focused))) {
+		return; // another application is in front: leave focus alone
+	}
+	bool buttons = any_button_down();
+	prev_buttons_ = buttons;
+	if (!follow_mouse || buttons) {
+		godot_hover_since_ = 0;
+		return; // clicks already move focus the normal Windows way
+	}
+	int x, y;
+	if (cursor_over_blender(x, y)) {
+		godot_hover_since_ = 0;
+		if (godot_front && !godot_text_focused && GetTickCount64() - shown_at_ > 150) {
 			focus_blender();
 		}
-		if (blender_has_focus()) {
-			pending_click_ = false;
-		}
 		return;
 	}
-
-	pending_click_ = false;
-	if (!has) {
+	if (!blender_front) {
 		return;
 	}
-	// Cursor is outside Blender. Only react when it is over a Godot window.
 	POINT pt = { x, y };
 	HWND w = WindowFromPoint(pt);
 	DWORD wpid = 0;
@@ -455,18 +500,11 @@ void WinEmbed::update_focus(bool follow_mouse, bool godot_text_focused) {
 		godot_hover_since_ = 0;
 		return;
 	}
-	if (pressed) {
+	uint64_t now = GetTickCount64();
+	if (!godot_hover_since_) {
+		godot_hover_since_ = now;
+	} else if (now - godot_hover_since_ > 250) {
 		focus_godot();
 		godot_hover_since_ = 0;
-		return;
-	}
-	if (follow_mouse && !buttons) {
-		uint64_t now = GetTickCount64();
-		if (!godot_hover_since_) {
-			godot_hover_since_ = now;
-		} else if (now - godot_hover_since_ > 250) {
-			focus_godot();
-			godot_hover_since_ = 0;
-		}
 	}
 }
