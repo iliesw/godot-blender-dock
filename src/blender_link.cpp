@@ -115,6 +115,7 @@ Error BlenderLink::start(int p_port) {
 }
 
 void BlenderLink::stop() {
+	_preview_clear();
 	if (peer.is_valid()) {
 		peer->disconnect_from_host();
 		peer.unref();
@@ -228,6 +229,9 @@ void BlenderLink::poll(bool p_sync_enabled) {
 		_bind_scene();
 	}
 
+	if (preview_mode) {
+		_preview_follow_root();
+	}
 	if (!pending_parent.is_empty()) {
 		_resolve_parents();
 	}
@@ -264,7 +268,11 @@ void BlenderLink::_read_peer() {
 
 	int64_t size = inbuf.size();
 	const uint8_t *data = inbuf.ptr();
+	uint64_t t0 = Time::get_singleton()->get_ticks_usec();
 	while (size - inbuf_off >= 8) {
+		if (Time::get_singleton()->get_ticks_usec() - t0 > FRAME_BUDGET_USEC) {
+			break; // keep the editor responsive: the rest is applied next frame
+		}
 		uint32_t frame_len = rd_u32(data + inbuf_off);
 		if (frame_len < 4 || frame_len > MAX_FRAME) {
 			UtilityFunctions::push_error("Blender Dock: corrupt link frame, resetting connection.");
@@ -480,6 +488,18 @@ void BlenderLink::_on_mesh(const Dictionary &h, const uint8_t *blob, int64_t blo
 		new_arrays.push_back(arrays);
 	}
 
+	if (pos_only && _fast_vertex_update(mc, new_arrays)) {
+		mc.surface_arrays = new_arrays; // GPU buffers updated in place, no rebuild
+		mc.revision++;
+		for (const KeyValue<String, uint64_t> &kv : nodes) {
+			if (kv.key.begins_with("o:") && kv.key.substr(2) == key) {
+				collision_dirty.insert(kv.key);
+			}
+		}
+		return;
+	}
+
+	mc.mesh->set_custom_aabb(AABB());
 	mc.mesh->clear_surfaces();
 	for (int i = 0; i < new_arrays.size(); i++) {
 		mc.mesh->add_surface_from_arrays(Mesh::PRIMITIVE_TRIANGLES, new_arrays[i]);
@@ -491,6 +511,9 @@ void BlenderLink::_on_mesh(const Dictionary &h, const uint8_t *blob, int64_t blo
 	mc.surface_arrays = new_arrays;
 	mc.surface_mats = new_mats;
 	mc.revision++;
+	if (!pos_only || !mc.fast_verified) {
+		_verify_fast_path(mc, key); // topology changed: re-check the direct-update encoder
+	}
 
 	// Collisions built from this mesh need regenerating; instances need the mesh hooked up.
 	for (const KeyValue<String, uint64_t> &kv : nodes) {
@@ -603,8 +626,9 @@ void BlenderLink::_on_scene(const Dictionary &h) {
 		meshes.erase(k);
 	}
 
-	String summary = vformat("%d objects, %d collections, %d instance groups, %d meshes", objects.size(),
-			collections.size(), (int)instance_xforms.size(), (int)meshes.size());
+	String summary = vformat("%d objects, %d collections, %d instance groups, %d meshes | %s: %d drawn directly, %d nodes",
+			objects.size(), collections.size(), (int)instance_xforms.size(), (int)meshes.size(),
+			preview_mode ? "preview" : "scene", (int)preview.size(), (int)nodes.size());
 	if (summary != last_summary) {
 		last_summary = summary;
 		UtilityFunctions::print("Blender Dock: ", summary);
@@ -612,6 +636,9 @@ void BlenderLink::_on_scene(const Dictionary &h) {
 }
 
 void BlenderLink::_on_selection(const Dictionary &h) {
+	if (preview_mode) {
+		return; // no nodes to select in preview mode: leave Godot's selection alone
+	}
 	PackedStringArray names = PackedStringArray(Array(h.get("names", Array())));
 	names.sort();
 	if (names == last_sel || !instance_from<Node3D>(link_root_id)) {
@@ -642,8 +669,8 @@ void BlenderLink::_on_selection(const Dictionary &h) {
 
 void BlenderLink::on_editor_selection_changed() {
 	Node3D *lr = instance_from<Node3D>(link_root_id);
-	if (!lr || !is_peer_connected()) {
-		return;
+	if (!lr || !is_peer_connected() || preview_mode) {
+		return; // preview mode: Godot selections never touch Blender's selection
 	}
 	TypedArray<Node> sel = EditorInterface::get_singleton()->get_selection()->get_selected_nodes();
 	PackedStringArray names;
@@ -732,6 +759,7 @@ bool BlenderLink::add_to_edited_scene() {
 		Node3D *lr = memnew(Node3D);
 		lr->set_name("BlenderLink");
 		lr->set_meta(ROOT_META, true);
+		lr->set_meta(MODE_META, "preview");
 		root->add_child(lr, true);
 		lr->set_owner(root);
 	}
@@ -755,6 +783,7 @@ void BlenderLink::_own_recursive(Node *p_node, Node *p_owner) {
 }
 
 void BlenderLink::_bind_scene() {
+	_preview_clear();
 	Node *root = EditorInterface::get_singleton()->get_edited_scene_root();
 	bound_scene_id = root ? uint64_t(root->get_instance_id()) : 0;
 	nodes.clear();
@@ -786,6 +815,26 @@ void BlenderLink::_bind_scene() {
 			stack.push_back(c);
 		}
 	}
+	// Mode: stored on the BlenderLink node. Links made before preview mode existed already hold
+	// real nodes, so they stay in scene mode; new links start in preview mode.
+	if (lr->has_meta(MODE_META)) {
+		preview_mode = String(lr->get_meta(MODE_META)) == "preview";
+	} else {
+		preview_mode = nodes.is_empty();
+	}
+	if (preview_mode) {
+		Vector<String> mirrored; // nodes left from scene mode are regenerated on demand
+		for (const KeyValue<String, uint64_t> &kv : nodes) {
+			mirrored.push_back(kv.key);
+		}
+		for (const String &k : mirrored) {
+			_remove_node(k);
+		}
+		if (sync_enabled) {
+			_preview_rebuild();
+		}
+		return;
+	}
 	if (!sync_enabled) {
 		return;
 	}
@@ -815,6 +864,7 @@ void BlenderLink::_bind_scene() {
 }
 
 void BlenderLink::_remove_node(const String &p_key) {
+	_preview_remove(p_key);
 	uint64_t *id = nodes.getptr(p_key);
 	if (!id) {
 		return;
@@ -878,8 +928,8 @@ void BlenderLink::_resolve_parents() {
 }
 
 void BlenderLink::_apply_collection(const String &p_name, const Dictionary &h) {
-	if (!sync_enabled || !instance_from<Node3D>(link_root_id)) {
-		return;
+	if (!sync_enabled || !instance_from<Node3D>(link_root_id) || preview_mode) {
+		return; // collections have no geometry of their own: nothing to preview
 	}
 	String key = "c:" + p_name;
 	Node3D *node = _node(key);
@@ -898,6 +948,10 @@ void BlenderLink::_apply_collection(const String &p_name, const Dictionary &h) {
 
 void BlenderLink::_apply_instances(const String &p_key) {
 	if (!sync_enabled || !instance_from<Node3D>(link_root_id)) {
+		return;
+	}
+	if (preview_mode) {
+		_preview_instances(p_key);
 		return;
 	}
 	PackedFloat32Array *buf = instance_xforms.getptr(p_key);
@@ -1006,8 +1060,18 @@ void BlenderLink::_apply_object(const String &p_name, const Dictionary &h) {
 		return;
 	}
 	Node3D *lr = instance_from<Node3D>(link_root_id);
+	if (OS::get_singleton()->get_environment("BLENDER_DOCK_DEBUG") == "1") {
+		UtilityFunctions::print("Blender Dock debug: apply ", p_name, " root=", lr != nullptr, " preview=", preview_mode);
+	}
 	if (!lr) {
 		return;
+	}
+	if (preview_mode) {
+		_preview_object(p_name, h);
+		return;
+	}
+	if (OS::get_singleton()->get_environment("BLENDER_DOCK_DEBUG") == "1") {
+		UtilityFunctions::print("Blender Dock debug: scene-mode apply ", p_name);
 	}
 	String key = "o:" + p_name;
 	String kind = h.get("kind", "empty");

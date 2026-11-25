@@ -102,6 +102,7 @@ void BlenderDockPlugin::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("_on_blender_path_selected", "path"), &BlenderDockPlugin::_on_blender_path_selected);
 	ClassDB::bind_method(D_METHOD("_on_sync_toggled", "on"), &BlenderDockPlugin::_on_sync_toggled);
 	ClassDB::bind_method(D_METHOD("_on_follow_toggled", "on"), &BlenderDockPlugin::_on_follow_toggled);
+	ClassDB::bind_method(D_METHOD("_on_scene_nodes_toggled", "on"), &BlenderDockPlugin::_on_scene_nodes_toggled);
 	ClassDB::bind_method(D_METHOD("_on_file_selected", "path"), &BlenderDockPlugin::_on_file_selected);
 	ClassDB::bind_method(D_METHOD("_on_selection_changed"), &BlenderDockPlugin::_on_selection_changed);
 	ClassDB::bind_method(D_METHOD("_on_recover_confirmed"), &BlenderDockPlugin::_on_recover_confirmed);
@@ -237,6 +238,10 @@ void BlenderDockPlugin::_build_panel(Panel &p) {
 	p.add_link = button("Link to Scene", "Node3D", "Add a BlenderLink node to the current 3D scene; Blender objects stream into it live.", "_on_add_link_pressed");
 	p.sync = check("Live Sync", sync_enabled, "Apply Blender changes to the scene in real time.", "_on_sync_toggled");
 	p.follow = check("Follow View", follow_view, "Both 3D views follow each other: the program you are working in drives the other.", "_on_follow_toggled");
+	p.scene_nodes = check("Scene Nodes", false,
+			"Off (default, fastest): Blender objects are drawn directly, nothing is added to the scene.\n"
+			"On: they become real nodes under BlenderLink: selectable, editable, saved with the scene.",
+			"_on_scene_nodes_toggled");
 	p.bake = button("Bake glTF", "PackedScene", "Export Blender's selection (rigs, skinning, shape keys, animations) as .glb into res://blender_assets.", "_on_bake_pressed");
 	p.settings = button("", "Tools", "Blender Dock settings", "_on_settings_pressed");
 
@@ -406,6 +411,9 @@ void BlenderDockPlugin::_enter_tree() {
 		callable_mp(this, &BlenderDockPlugin::_on_launch_pressed).call_deferred();
 		pending_auto_link = env_auto;
 	}
+	if (OS::get_singleton()->get_environment("BLENDER_DOCK_ENCODER_TEST") == "1") {
+		UtilityFunctions::print("ENCODER TEST\n", BlenderLink::self_test_encoder());
+	}
 	String perf_env = OS::get_singleton()->get_environment("BLENDER_DOCK_PERFTEST");
 	if (perf_env == "1" || perf_env == "focus") {
 		perf_step = 0;
@@ -542,7 +550,8 @@ void BlenderDockPlugin::_update_ui() {
 	} else {
 		linkst = vformat("Link: waiting on :%d", link->get_port());
 	}
-	String scene = link.is_valid() && link->edited_scene_has_link() ? String(" | scene linked") : String();
+	String scene = !(link.is_valid() && link->edited_scene_has_link()) ? String()
+			: (link->is_preview_mode() ? String(" | preview") : String(" | scene nodes"));
 	String status = blender + " | " + linkst + scene;
 	double now = Time::get_singleton()->get_ticks_msec() / 1000.0;
 	if (!notice.is_empty() && now - notice_time < 6.0) {
@@ -566,6 +575,9 @@ void BlenderDockPlugin::_update_ui() {
 		p->bake->set_disabled(!connected);
 		p->sync->set_pressed_no_signal(sync_enabled);
 		p->follow->set_pressed_no_signal(follow_view);
+		bool linked = link.is_valid() && link->edited_scene_has_link();
+		p->scene_nodes->set_disabled(!linked);
+		p->scene_nodes->set_pressed_no_signal(linked && !link->is_preview_mode());
 		p->follow->set_disabled(!connected);
 
 		String ph;
@@ -1252,6 +1264,13 @@ void BlenderDockPlugin::_on_follow_toggled(bool p_on) {
 		d["t"] = "follow";
 		d["on"] = p_on;
 		link->send(d);
+	}
+	_update_ui();
+}
+
+void BlenderDockPlugin::_on_scene_nodes_toggled(bool p_on) {
+	if (link.is_valid()) {
+		link->set_preview_mode(!p_on);
 	}
 	_update_ui();
 }

@@ -23,6 +23,7 @@
 // Parent keys: "" = BlenderLink root, "o:<object>", "c:<collection>". Node keys add "i:<instance group>".
 
 #include <godot_cpp/classes/array_mesh.hpp>
+#include <godot_cpp/classes/multi_mesh.hpp>
 #include <godot_cpp/classes/node3d.hpp>
 #include <godot_cpp/classes/ref_counted.hpp>
 #include <godot_cpp/classes/standard_material3d.hpp>
@@ -41,6 +42,7 @@ class BlenderLink : public RefCounted {
 public:
 	static constexpr const char *ROOT_META = "blender_link_root";
 	static constexpr const char *NAME_META = "blender_name"; // node key, e.g. "o:Cube"
+	static constexpr const char *MODE_META = "blender_link_mode"; // "preview" (default) or "scene"
 
 	Error start(int p_port);
 	void stop();
@@ -63,6 +65,14 @@ public:
 	Node3D *get_link_root();
 
 	void send(const Dictionary &p_header);
+
+	// Preview: draw through RenderingServer only (no nodes, no editor overhead).
+	// Scene: real nodes in the scene (selectable, editable, saved).
+	bool is_preview_mode() const { return preview_mode; }
+	bool set_preview_mode(bool p_preview);
+	static String self_test_encoder(); // BLENDER_DOCK_ENCODER_TEST=1
+
+	~BlenderLink() { _preview_clear(); }
 	// Editor shutdown: send save_quit and block (up to p_timeout_ms) until Blender acknowledges.
 	bool send_save_quit(const String &p_path, int p_timeout_ms);
 
@@ -79,7 +89,33 @@ private:
 		Vector<Array> surface_arrays; // last full arrays, reused by position-only updates
 		Vector<String> surface_mats;
 		uint64_t revision = 0;
+		bool fast_verified = false; // encoder checked against Godot's own buffer
+		Vector<bool> fast_ok;
 	};
+	struct PreviewItem {
+		RID instance;
+		RID light;
+		String mesh;
+		String kind;
+	};
+
+	static bool _encode_vertex_buffer(uint64_t p_format, const Array &p_arrays, PackedByteArray &r_out);
+	void _verify_fast_path(MeshCache &mc, const String &p_key);
+	bool _fast_vertex_update(MeshCache &mc, const Vector<Array> &p_new_arrays);
+	RID _preview_scenario();
+	void _preview_object(const String &p_name, const Dictionary &h);
+	void _preview_instances(const String &p_key);
+	void _preview_remove(const String &p_key);
+	void _preview_clear();
+	void _preview_rebuild();
+	void _preview_follow_root();
+
+	bool preview_mode = true;
+	bool fast_path_reported = false;
+	HashMap<String, PreviewItem> preview;
+	HashMap<String, Ref<MultiMesh>> preview_mm;
+	Transform3D preview_root_xform;
+	static constexpr uint64_t FRAME_BUDGET_USEC = 4000; // max time per editor frame applying Blender data
 
 	void _read_peer();
 	void _handle_frame(const Dictionary &p_header, const uint8_t *p_blob, int64_t p_blob_len);

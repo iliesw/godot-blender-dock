@@ -59,6 +59,7 @@ private:
 		Button *settings = nullptr;
 		CheckBox *sync = nullptr;
 		CheckBox *follow = nullptr;
+		CheckBox *scene_nodes = nullptr;
 		Label *status = nullptr;
 		Control *loading = nullptr; // startup progress, shown over the host
 		Label *loading_label = nullptr;
@@ -106,6 +107,7 @@ private:
 	void _on_blender_path_selected(const String &p_path);
 	void _on_sync_toggled(bool p_on);
 	void _on_follow_toggled(bool p_on);
+	void _on_scene_nodes_toggled(bool p_on);
 	void _on_file_selected(const String &p_path);
 	void _on_selection_changed();
 	void _on_recover_confirmed();

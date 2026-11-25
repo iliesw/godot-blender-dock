@@ -781,6 +781,7 @@ def _object_header(ob, synced):
     if parent.startswith("o:"):
         world = _godot_world(bpy.data.objects[parent[2:]]).inverted_safe() @ world
     h["xform"] = _to_list12(world)
+    h["world"] = _to_list12(_godot_world(ob))  # preview mode draws in world space
     if ob.type in GEOMETRY_TYPES:
         h["kind"] = "mesh"
         h["mesh"] = ob.name
