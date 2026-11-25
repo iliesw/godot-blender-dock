@@ -35,12 +35,13 @@ namespace {
 
 const char *S_BLENDER_PATH = "blender_dock/blender_path";
 const char *S_PORT = "blender_dock/link_port";
-const char *S_FOLLOW_MOUSE = "blender_dock/focus_follows_mouse";
+const char *S_FOLLOW_MOUSE = "blender_dock/hover_gives_focus"; // opt-in: switching focus on hover costs a window activation
 const char *S_AUTO_LAUNCH = "blender_dock/auto_launch";
 const char *S_MATCH_THEME = "blender_dock/match_godot_theme";
 const char *S_HIDE_STATUSBAR = "blender_dock/hide_blender_status_bar";
 const char *S_RECOVERY = "blender_dock/recovery_interval_seconds";
 const char *S_KEEP_SPLASH = "blender_dock/show_blender_splash";
+const char *S_HITCH_LOG = "blender_dock/log_hitches";
 const char *P_BLEND_FILE = "blender_dock/blend_file";
 const char *SCRIPT_PATH = "res://addons/blender_dock/blender/godot_link.py";
 
@@ -125,7 +126,8 @@ void BlenderDockPlugin::_ensure_settings() {
 	};
 	add(S_BLENDER_PATH, String(), PROPERTY_HINT_GLOBAL_FILE, "*.exe");
 	add(S_PORT, 6789, PROPERTY_HINT_RANGE, "1024,65535,1");
-	add(S_FOLLOW_MOUSE, true, PROPERTY_HINT_NONE, "");
+	add(S_FOLLOW_MOUSE, false, PROPERTY_HINT_NONE, "");
+	add(S_HITCH_LOG, true, PROPERTY_HINT_NONE, "");
 	add(S_AUTO_LAUNCH, false, PROPERTY_HINT_NONE, "");
 	add(S_MATCH_THEME, true, PROPERTY_HINT_NONE, "");
 	add(S_HIDE_STATUSBAR, true, PROPERTY_HINT_NONE, "");
@@ -332,7 +334,7 @@ void BlenderDockPlugin::_build_settings() {
 		grid->add_child(r_box);
 	};
 	flag("Startup", "Launch Blender when the editor opens", s.auto_launch);
-	flag("Keyboard focus", "Follows the mouse (otherwise: click to focus)", s.follow_mouse);
+	flag("Keyboard focus", "Hovering gives focus (default: click, like normal windows)", s.follow_mouse);
 	flag("Look", "Match Blender's colors to the Godot theme", s.theme);
 	flag("", "Hide Blender's status bar while docked", s.statusbar);
 	flag("", "Show Blender's splash screen", s.splash);
@@ -403,8 +405,10 @@ void BlenderDockPlugin::_enter_tree() {
 		callable_mp(this, &BlenderDockPlugin::_on_launch_pressed).call_deferred();
 		pending_auto_link = env_auto;
 	}
-	if (OS::get_singleton()->get_environment("BLENDER_DOCK_PERFTEST") == "1") {
+	String perf_env = OS::get_singleton()->get_environment("BLENDER_DOCK_PERFTEST");
+	if (perf_env == "1" || perf_env == "focus") {
 		perf_step = 0;
+		perf_focus_mode = perf_env == "focus";
 	}
 	if (OS::get_singleton()->get_environment("BLENDER_DOCK_SELFTEST") == "1") {
 		selftest_step = 0;
@@ -666,6 +670,7 @@ EmbedRect BlenderDockPlugin::_launch_rect() {
 
 void BlenderDockPlugin::_process(double p_delta) {
 	uint64_t perf_t0 = Time::get_singleton()->get_ticks_usec();
+	_log_hitch(p_delta);
 	_process_inner(p_delta);
 	if (perf_step >= 0) {
 		_perf_test(p_delta, Time::get_singleton()->get_ticks_usec() - perf_t0);
@@ -676,11 +681,16 @@ void BlenderDockPlugin::_process(double p_delta) {
 void BlenderDockPlugin::_perf_test(double p_delta, uint64_t p_cost_us) {
 	EditorInterface *ei = EditorInterface::get_singleton();
 	if (perf_step == 0) {
-		if (link->is_peer_connected() && embed->has_window() && link->get_object_count() >= 3) {
+		if (link->is_peer_connected() && embed->is_embedded() && blender_ready && link->get_object_count() >= 3) {
 			OS::get_singleton()->set_low_processor_usage_mode(false); // continuous frames: gaps = stalls
 			perf_step = 1;
 			perf_time = 0;
-			ei->set_main_screen_editor("Blender");
+			if (perf_focus_mode) {
+				ei->set_main_screen_editor("3D"); // Blender in the bottom dock, under the 3D view
+				dock->make_visible();
+			} else {
+				ei->set_main_screen_editor("Blender");
+			}
 		}
 		return;
 	}
@@ -690,9 +700,17 @@ void BlenderDockPlugin::_perf_test(double p_delta, uint64_t p_cost_us) {
 	perf_sum_gap += p_delta;
 	perf_max_cost = MAX(perf_max_cost, p_cost_us);
 	if (perf_time > 1.5) {
+		String label = perf_focus_mode ? String(embed->blender_has_focus() ? "focus=Blender" : (this_process_is_foreground() ? "focus=Godot" : "focus=other"))
+										: String(main_visible ? "Blender" : "3D");
 		UtilityFunctions::print(vformat("PERF phase %d (%s): frames %d, avg %.1f ms, worst gap %.1f ms, worst plugin cost %.2f ms",
-				perf_step, main_visible ? "Blender" : "3D", perf_frames, 1000.0 * perf_sum_gap / MAX(1, perf_frames),
+				perf_step, label, perf_frames, 1000.0 * perf_sum_gap / MAX(1, perf_frames),
 				1000.0 * perf_max_gap, perf_max_cost / 1000.0));
+		UtilityFunctions::print(vformat("PERF   sections ms: link %.1f find %.1f embed %.1f rect/vis %.1f focus %.1f msgs %.1f ui %.1f",
+				perf_sec[0] / 1000.0, perf_sec[1] / 1000.0, perf_sec[2] / 1000.0, perf_sec[3] / 1000.0, perf_sec[4] / 1000.0,
+				perf_sec[5] / 1000.0, perf_sec[6] / 1000.0));
+		for (uint64_t &v : perf_sec) {
+			v = 0;
+		}
 		perf_frames = 0;
 		perf_max_gap = perf_sum_gap = 0;
 		perf_max_cost = 0;
@@ -704,11 +722,49 @@ void BlenderDockPlugin::_perf_test(double p_delta, uint64_t p_cost_us) {
 			perf_step = -1;
 			return;
 		}
-		ei->set_main_screen_editor((perf_step % 2) ? "Blender" : "3D");
+		if (perf_focus_mode) {
+			if (perf_step % 2) {
+				embed->focus_blender_now();
+			} else {
+				embed->focus_godot();
+			}
+		} else {
+			ei->set_main_screen_editor((perf_step % 2) ? "Blender" : "3D");
+		}
+	}
+}
+
+#define PERF_MARK(i)                                                                   \
+	do {                                                                               \
+		uint64_t _n = Time::get_singleton()->get_ticks_usec();                         \
+		frame_sec[i] = _n - _perf_t;                                                   \
+		if (perf_step > 0) {                                                           \
+			perf_sec[i] = MAX(perf_sec[i], _n - _perf_t);                              \
+		}                                                                              \
+		_perf_t = _n;                                                                  \
+	} while (0)
+
+// Diagnostics: any frame gap over 50 ms is written to user://blender_dock_hitches.log together
+// with the previous frame's plugin section times and who had focus, so lag reports have data.
+void BlenderDockPlugin::_log_hitch(double p_delta) {
+	if (!bool(_setting(S_HITCH_LOG, true)) || !embed->is_running() || !blender_ready || p_delta < 0.05) {
+		return;
+	}
+	String who = embed->blender_has_focus() ? "Blender" : (this_process_is_foreground() ? "Godot" : "other app");
+	String line = vformat("%s gap %.0f ms | focus %s | screen %s | plugin ms: link %.1f find %.1f embed %.1f rect %.1f focus %.1f msgs %.1f ui %.1f",
+			Time::get_singleton()->get_time_string_from_system(), p_delta * 1000.0, who, main_visible ? "Blender" : "other",
+			frame_sec[0] / 1000.0, frame_sec[1] / 1000.0, frame_sec[2] / 1000.0, frame_sec[3] / 1000.0, frame_sec[4] / 1000.0,
+			frame_sec[5] / 1000.0, frame_sec[6] / 1000.0);
+	String path = OS::get_singleton()->get_user_data_dir().path_join("blender_dock_hitches.log");
+	Ref<FileAccess> f = FileAccess::file_exists(path) ? FileAccess::open(path, FileAccess::READ_WRITE) : FileAccess::open(path, FileAccess::WRITE);
+	if (f.is_valid()) {
+		f->seek_end();
+		f->store_line(line);
 	}
 }
 
 void BlenderDockPlugin::_process_inner(double p_delta) {
+	uint64_t _perf_t = Time::get_singleton()->get_ticks_usec();
 	// Giving Blender the keyboard sends Godot a focus-out, and Godot then throttles the editor to
 	// its "unfocused" rate (10 fps by default) until the window is re-activated, which never
 	// happens for a child window. Keep normal pacing whenever Godot's own window is in front.
@@ -735,12 +791,14 @@ void BlenderDockPlugin::_process_inner(double p_delta) {
 		}
 		link->watch_selected_transforms();
 	}
+	PERF_MARK(0); // link
 
 	if (embed->is_running()) {
 		if (!embed->has_window()) {
 			embed->find_window(); // every frame while starting: hide it the moment it appears
 		}
 		embed->enforce_hold();
+		PERF_MARK(1); // find/hold
 		if (embed->has_window() && !popped_out) {
 			Control *host = _active_host();
 			Vector2 size = host ? host->get_size() : Vector2();
@@ -760,12 +818,15 @@ void BlenderDockPlugin::_process_inner(double p_delta) {
 				r.y = int(std::floor(pos.y));
 				r.w = int(std::ceil(size.x));
 				r.h = int(std::ceil(size.y));
+				PERF_MARK(2); // embed
 				embed->set_rect(r);
 				embed->set_visible(true);
+				PERF_MARK(3); // rect+visible
 
 				Control *focus = EditorInterface::get_singleton()->get_base_control()->get_viewport()->gui_get_focus_owner();
 				bool text = Object::cast_to<LineEdit>(focus) || Object::cast_to<TextEdit>(focus);
-				embed->update_focus(bool(_setting(S_FOLLOW_MOUSE, true)), text);
+				embed->update_focus(bool(_setting(S_FOLLOW_MOUSE, false)), text);
+				PERF_MARK(4); // focus
 			} else {
 				embed->set_visible(false);
 			}
@@ -783,6 +844,7 @@ void BlenderDockPlugin::_process_inner(double p_delta) {
 		_send_chrome();
 	}
 
+	PERF_MARK(5); // messages
 	_update_startup(p_delta);
 
 	if (follow_view) {
@@ -807,6 +869,7 @@ void BlenderDockPlugin::_process_inner(double p_delta) {
 		ui_cooldown = 0.25;
 		_update_ui();
 	}
+	PERF_MARK(6); // startup/ui
 }
 
 void BlenderDockPlugin::_self_test(double p_delta) {
@@ -1126,7 +1189,7 @@ void BlenderDockPlugin::_on_settings_pressed() {
 	s.port->set_value(int(_setting(S_PORT, 6789)));
 	s.recovery->set_value(int(_setting(S_RECOVERY, 30)));
 	s.auto_launch->set_pressed(_setting(S_AUTO_LAUNCH, false));
-	s.follow_mouse->set_pressed(_setting(S_FOLLOW_MOUSE, true));
+	s.follow_mouse->set_pressed(_setting(S_FOLLOW_MOUSE, false));
 	s.theme->set_pressed(_setting(S_MATCH_THEME, true));
 	s.statusbar->set_pressed(_setting(S_HIDE_STATUSBAR, true));
 	s.splash->set_pressed(_setting(S_KEEP_SPLASH, false));

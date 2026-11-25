@@ -62,6 +62,7 @@ public:
 	void update_focus(bool follow_mouse, bool godot_text_focused);
 	bool blender_has_focus();
 	void focus_godot();
+	void focus_blender_now() { focus_blender(); } // tests
 
 private:
 	void attach_input(bool attach);

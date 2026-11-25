@@ -151,9 +151,13 @@ private:
 	void _process_inner(double p_delta);
 	void _perf_test(double p_delta, uint64_t p_cost_us);
 	int perf_step = -1;
+	bool perf_focus_mode = false; // BLENDER_DOCK_PERFTEST=focus: bounce keyboard focus Godot <-> Blender
 	double perf_time = 0.0, perf_max_gap = 0.0, perf_sum_gap = 0.0;
 	int perf_frames = 0;
 	uint64_t perf_max_cost = 0;
+	uint64_t perf_sec[8] = {};
+	uint64_t frame_sec[8] = {};
+	void _log_hitch(double p_delta);
 };
 
 } // namespace godot
