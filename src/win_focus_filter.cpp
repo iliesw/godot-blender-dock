@@ -30,6 +30,12 @@ DWORD g_blender_pid = 0;
 bool g_godot_app_focused = true; // what Godot currently believes about application focus
 DWORD g_main_tid = 0;
 bool g_focus_out_posted = false;
+// Per Godot window: does Godot believe it is the active window? (DisplayServerWindows tracks this
+// only through WM_ACTIVATE -> _process_activate_event; WM_SETFOCUS/KILLFOCUS are not handled.)
+std::unordered_map<HWND, bool> g_window_active;
+std::unordered_map<HWND, bool> g_deactivate_posted;
+DWORD g_last_fg_pid = 0; // foreground owner last frame (fallback when WM_ACTIVATE has no lParam)
+
 
 bool belongs_to_blender(HWND h) {
 	DWORD pid = 0;
@@ -37,6 +43,12 @@ bool belongs_to_blender(HWND h) {
 		GetWindowThreadProcessId(h, &pid);
 	}
 	return g_blender_pid && pid == g_blender_pid;
+}
+
+bool cursor_over_blender() {
+	POINT pt;
+	GetCursorPos(&pt);
+	return belongs_to_blender(WindowFromPoint(pt));
 }
 
 LRESULT CALLBACK filter_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
@@ -58,9 +70,42 @@ LRESULT CALLBACK filter_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) 
 		g_godot_app_focused = activating;
 		g_focus_out_posted = false;
 	}
+	if (msg == WM_NCACTIVATE && g_blender_tid && wparam == FALSE &&
+			(belongs_to_blender(GetForegroundWindow()) || cursor_over_blender())) {
+		// Title bar keeps its active look while the docked Blender is in front.
+		return orig ? CallWindowProcW(orig, hwnd, msg, TRUE, lparam) : DefWindowProcW(hwnd, msg, TRUE, lparam);
+	}
+	if (msg == WM_ACTIVATE && g_blender_tid) {
+		WORD state = LOWORD(wparam);
+		HWND other = reinterpret_cast<HWND>(lparam);
+		bool activating = state == WA_ACTIVE || state == WA_CLICKACTIVE;
+		bool other_is_blender;
+		if (other) {
+			other_is_blender = belongs_to_blender(other);
+		} else if (activating) {
+			other_is_blender = g_last_fg_pid == g_blender_pid; // coming back from Blender
+		} else {
+			other_is_blender = belongs_to_blender(GetForegroundWindow()) || cursor_over_blender();
+		}
+		bool believed_active = g_window_active.count(hwnd) ? g_window_active[hwnd] : false;
+		if (other_is_blender && believed_active) {
+			if (activating) {
+				// Godot's own activation does SetFocus; do just that so the keyboard comes back,
+				// without the focus-in event (no editor-wide refresh).
+				if (!IsIconic(hwnd)) {
+					SetFocus(hwnd);
+				}
+			}
+			return 0; // Godot <-> docked Blender: Godot stays "active"
+		}
+		g_window_active[hwnd] = activating;
+		g_deactivate_posted[hwnd] = false;
+	}
 	if (msg == WM_NCDESTROY) {
 		LRESULT r = orig ? CallWindowProcW(orig, hwnd, msg, wparam, lparam) : DefWindowProcW(hwnd, msg, wparam, lparam);
 		g_original.erase(hwnd);
+		g_window_active.erase(hwnd);
+		g_deactivate_posted.erase(hwnd);
 		return r;
 	}
 	return orig ? CallWindowProcW(orig, hwnd, msg, wparam, lparam) : DefWindowProcW(hwnd, msg, wparam, lparam);
@@ -78,6 +123,7 @@ BOOL CALLBACK hook_window(HWND h, LPARAM) {
 	WNDPROC prev = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(h, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&filter_proc)));
 	if (prev) {
 		g_original[h] = prev;
+		g_window_active[h] = GetForegroundWindow() == h;
 	}
 	return TRUE;
 }
@@ -99,6 +145,16 @@ void focus_filter_update(uint32_t p_blender_pid, uint32_t p_blender_tid) {
 	HWND fg = GetForegroundWindow();
 	DWORD fg_pid = 0;
 	DWORD fg_tid = fg ? GetWindowThreadProcessId(fg, &fg_pid) : 0;
+	if (fg && fg_pid != GetCurrentProcessId() && fg_pid != g_blender_pid) {
+		for (auto &kv : g_window_active) {
+			if (kv.second && !g_deactivate_posted[kv.first]) {
+				// Real window deactivation, delivered through the normal path (passes the filter).
+				g_deactivate_posted[kv.first] = PostMessageW(kv.first, WM_ACTIVATE, MAKEWPARAM(WA_INACTIVE, 0),
+														 reinterpret_cast<LPARAM>(fg)) != 0;
+			}
+		}
+	}
+	g_last_fg_pid = fg_pid;
 	if (fg && g_godot_app_focused && !g_focus_out_posted && fg_pid != GetCurrentProcessId() && fg_pid != g_blender_pid &&
 			!g_original.empty()) {
 		// Posted (not called) so Godot handles it in its normal message loop; it passes the filter
@@ -124,6 +180,8 @@ void focus_filter_shutdown() {
 		}
 	}
 	g_original.clear();
+	g_window_active.clear();
+	g_deactivate_posted.clear();
 	g_blender_tid = 0;
 	g_blender_pid = 0;
 }

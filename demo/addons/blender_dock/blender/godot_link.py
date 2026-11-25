@@ -295,6 +295,9 @@ def _save_quit(path):
         _rescue_window()
         return
     _clear_recovery()
+    h = _focus_hook()
+    if h:
+        h.bdh_shutdown()
     _log("saved, quitting")
     _run_op(lambda: bpy.ops.wm.quit_blender())
 
@@ -885,6 +888,7 @@ def _tick():
     try:
         _try_connect()
         _allow_godot_foreground()
+        _update_focus_hook()
         _apply_chrome()
         _recovery_tick()
         if not L.sock:
@@ -1047,6 +1051,33 @@ def _clear_recovery():
 
 
 atexit.register(_clear_recovery)  # clean exit -> nothing to recover
+
+
+_hook = None
+
+
+def _focus_hook():
+    """Native helper (bin/blender_focus_hook.dll): Blender keeps focus when the user clicks Godot."""
+    global _hook
+    if _hook is not None or os.name != "nt" or not GODOT_PID:
+        return _hook or None
+    script = globals().get("__file__") or next((a for a in sys.argv if a.endswith("godot_link.py")), "")
+    dll = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(script))), "bin", "blender_focus_hook.dll")
+    try:
+        _hook = ctypes.CDLL(dll)
+        _hook.bdh_update.argtypes = [ctypes.c_uint]
+        _hook.bdh_update.restype = ctypes.c_int
+        _log("focus hook loaded")
+    except OSError as e:
+        _hook = False
+        _log(f"focus hook unavailable: {e}")
+    return _hook or None
+
+
+def _update_focus_hook():
+    h = _focus_hook()
+    if h:
+        h.bdh_update(GODOT_PID if L.docked else 0)
 
 
 def _allow_godot_foreground():

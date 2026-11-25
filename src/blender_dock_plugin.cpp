@@ -475,11 +475,34 @@ void BlenderDockPlugin::_exit_tree() {
 }
 
 void BlenderDockPlugin::_notification(int p_what) {
-	if (p_what == NOTIFICATION_APPLICATION_FOCUS_IN || p_what == NOTIFICATION_APPLICATION_FOCUS_OUT) {
-		if (OS::get_singleton()->get_environment("BLENDER_DOCK_DEBUG") == "1") {
-			UtilityFunctions::print("Blender Dock debug: Godot application focus ",
-					p_what == NOTIFICATION_APPLICATION_FOCUS_IN ? "IN" : "OUT", " at ", Time::get_singleton()->get_ticks_msec());
-		}
+	// Record every focus change that still reaches Godot (switching with the docked Blender
+	// should produce none) in the stall log, so lag reports show it.
+	const char *what = nullptr;
+	switch (p_what) {
+		case NOTIFICATION_APPLICATION_FOCUS_IN:
+			what = "app focus IN";
+			break;
+		case NOTIFICATION_APPLICATION_FOCUS_OUT:
+			what = "app focus OUT";
+			break;
+		case NOTIFICATION_WM_WINDOW_FOCUS_IN:
+			what = "window focus IN";
+			break;
+		case NOTIFICATION_WM_WINDOW_FOCUS_OUT:
+			what = "window focus OUT";
+			break;
+		default:
+			return;
+	}
+	if (!embed || !embed->is_running() || !bool(_setting(S_HITCH_LOG, true))) {
+		return;
+	}
+	String who = embed->blender_has_focus() ? "Blender" : (this_process_is_foreground() ? "Godot" : "other app");
+	String path = OS::get_singleton()->get_user_data_dir().path_join("blender_dock_hitches.log");
+	Ref<FileAccess> f = FileAccess::file_exists(path) ? FileAccess::open(path, FileAccess::READ_WRITE) : FileAccess::open(path, FileAccess::WRITE);
+	if (f.is_valid()) {
+		f->seek_end();
+		f->store_line(Time::get_singleton()->get_time_string_from_system() + " " + what + " | foreground " + who);
 	}
 }
 

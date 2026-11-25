@@ -16,4 +16,12 @@ library = env.SharedLibrary(
     source=sources,
 )
 env.NoCache(library)
-Default(library)
+
+# Small native helper loaded INTO Blender (ctypes) so Blender does not lose focus to the Godot
+# that docks it. Plain Win32: no godot-cpp.
+hook = None
+if env["platform"] == "windows":
+    henv = Environment(tools=["msvc", "mslink"], TARGET_ARCH="x86_64")
+    henv.Append(CCFLAGS=["/O2", "/EHsc", "/MT", "/nologo"], LIBS=["user32"])
+    hook = henv.SharedLibrary("demo/addons/blender_dock/bin/blender_focus_hook", ["src_hook/blender_focus_hook.cpp"])
+Default(library, hook) if hook else Default(library)
