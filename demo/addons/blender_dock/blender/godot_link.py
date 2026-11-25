@@ -92,6 +92,7 @@ class Link:
     parent_hwnd = 0
     godot_died = False
     quitting = False
+    last_tick_time = 0.0
     obj_sent = {}  # object name -> last header sent (change-only protocol)
     follow = False
     last_view_sent = None
@@ -868,7 +869,19 @@ def _selection_state():
     return names, (act.name if act and act.name in names else "")
 
 
+def _note_blender_hitch():
+    """Blender-side stall log: the timer should fire every ~33 ms; a much later call means
+    Blender's UI thread was busy (that is lag felt inside Blender)."""
+    now = time.monotonic()
+    last = L.last_tick_time
+    L.last_tick_time = now
+    if last and now - last > 0.15:
+        active = "Blender" if _blender_is_active() else "other"
+        _log(f"blender stall {int((now - last) * 1000)} ms | active {active} | docked {L.docked}")
+
+
 def _tick():
+    _note_blender_hitch()
     try:
         _try_connect()
         _allow_godot_foreground()

@@ -30,6 +30,7 @@ public:
 	bool is_running();
 	void terminate();
 	uint32_t pid() const { return pid_; }
+	uint32_t blender_thread() const { return blender_thread_; }
 
 	// Window ----------------------------------------------------------------
 	// Looks for Blender's main GHOST window (once per call). Returns true when found.

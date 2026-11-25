@@ -1,6 +1,7 @@
 #include "blender_dock_plugin.h"
 
 #include "win_embed.h"
+#include "win_focus_filter.h"
 
 #include <godot_cpp/classes/camera3d.hpp>
 #include <godot_cpp/classes/center_container.hpp>
@@ -426,6 +427,7 @@ void BlenderDockPlugin::_enter_tree() {
 
 void BlenderDockPlugin::_exit_tree() {
 	set_process(false);
+	focus_filter_shutdown();
 	_restore_unfocused_speed();
 	EditorSelection *sel = EditorInterface::get_singleton()->get_selection();
 	if (sel && sel->is_connected("selection_changed", Callable(this, "_on_selection_changed"))) {
@@ -470,6 +472,15 @@ void BlenderDockPlugin::_exit_tree() {
 	file_dialog = nullptr;
 	recover_dialog = nullptr;
 	settings = SettingsUI();
+}
+
+void BlenderDockPlugin::_notification(int p_what) {
+	if (p_what == NOTIFICATION_APPLICATION_FOCUS_IN || p_what == NOTIFICATION_APPLICATION_FOCUS_OUT) {
+		if (OS::get_singleton()->get_environment("BLENDER_DOCK_DEBUG") == "1") {
+			UtilityFunctions::print("Blender Dock debug: Godot application focus ",
+					p_what == NOTIFICATION_APPLICATION_FOCUS_IN ? "IN" : "OUT", " at ", Time::get_singleton()->get_ticks_msec());
+		}
+	}
 }
 
 void BlenderDockPlugin::_make_visible(bool p_visible) {
@@ -825,7 +836,13 @@ void BlenderDockPlugin::_process_inner(double p_delta) {
 	uint64_t _perf_t = Time::get_singleton()->get_ticks_usec();
 	_sync_unfocused_speed();
 	if (embed->is_running()) {
-		embed->update_priority(this_process_is_foreground());
+		embed->update_priority(!embed->blender_has_focus()); // full priority only while Blender is in front
+	}
+	// Godot <-> docked Blender switches are not application switches for Godot.
+	if (embed->is_running() && embed->is_embedded() && !popped_out) {
+		focus_filter_update(embed->pid(), embed->blender_thread());
+	} else {
+		focus_filter_update(0, 0);
 	}
 
 	if (link.is_valid()) {

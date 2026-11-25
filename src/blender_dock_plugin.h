@@ -36,6 +36,7 @@ public:
 	void _enter_tree() override;
 	void _exit_tree() override;
 	void _process(double p_delta) override;
+	void _notification(int p_what);
 	void _save_external_data() override;
 
 	bool _has_main_screen() const override { return true; }
