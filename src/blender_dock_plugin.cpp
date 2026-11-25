@@ -812,6 +812,9 @@ void BlenderDockPlugin::_restore_unfocused_speed() {
 void BlenderDockPlugin::_process_inner(double p_delta) {
 	uint64_t _perf_t = Time::get_singleton()->get_ticks_usec();
 	_sync_unfocused_speed();
+	if (embed->is_running()) {
+		embed->update_priority(this_process_is_foreground());
+	}
 
 	if (link.is_valid()) {
 		link->poll(sync_enabled);

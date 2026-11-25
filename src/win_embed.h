@@ -62,6 +62,9 @@ public:
 	void update_focus(bool follow_mouse, bool godot_text_focused);
 	bool blender_has_focus();
 	void focus_godot();
+	// Below-normal CPU priority while Godot is the active window, so Blender bursts never starve the editor.
+	void update_priority(bool p_godot_active);
+	int priority_state_ = -1;
 	void focus_blender_now() { focus_blender(); } // tests
 
 private:

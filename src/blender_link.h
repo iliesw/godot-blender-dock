@@ -141,6 +141,7 @@ private:
 	HashSet<String> collision_dirty;
 	uint64_t next_collision_ms = 0;
 	bool scene_changed = false;
+	uint64_t next_unsaved_ms = 0;
 	String last_summary;
 
 	// Two-way state

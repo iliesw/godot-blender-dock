@@ -236,8 +236,9 @@ void BlenderLink::poll(bool p_sync_enabled) {
 		_refresh_collisions();
 	}
 
-	if (scene_changed) {
+	if (scene_changed && now_ms() >= next_unsaved_ms) {
 		scene_changed = false;
+		next_unsaved_ms = now_ms() + 1000; // the editor repaints tabs/title on every call
 		if (instance_from<Node3D>(link_root_id)) {
 			EditorInterface::get_singleton()->mark_scene_as_unsaved();
 		}
@@ -889,7 +890,10 @@ void BlenderLink::_apply_collection(const String &p_name, const Dictionary &h) {
 		nodes[key] = uint64_t(node->get_instance_id());
 	}
 	_place(node, h.get("parent", ""), key);
-	node->set_visible(h.get("visible", true));
+	bool vis = h.get("visible", true);
+	if (node->is_visible() != vis) {
+		node->set_visible(vis);
+	}
 }
 
 void BlenderLink::_apply_instances(const String &p_key) {
@@ -1038,14 +1042,21 @@ void BlenderLink::_apply_object(const String &p_name, const Dictionary &h) {
 
 	uint64_t *until = local_edit_until.getptr(key);
 	bool godot_editing = until && now_ms() < *until;
+	// Only touch what changed: every property write makes the editor refresh the Inspector /
+	// scene tree / gizmos, which is where idle-time hitches came from.
 	Array x = h.get("xform", Array());
 	if (x.size() == 12 && !godot_editing) {
 		Basis b(Vector3(x[0], x[1], x[2]), Vector3(x[3], x[4], x[5]), Vector3(x[6], x[7], x[8]));
 		Transform3D t(b, Vector3(x[9], x[10], x[11]));
-		node->set_transform(t);
+		if (!node->get_transform().is_equal_approx(t)) {
+			node->set_transform(t);
+		}
 		applied_xform[key] = t;
 	}
-	node->set_visible(h.get("visible", true));
+	bool vis = h.get("visible", true);
+	if (node->is_visible() != vis) {
+		node->set_visible(vis);
+	}
 
 	if (MeshInstance3D *mi = Object::cast_to<MeshInstance3D>(node)) {
 		MeshCache *mc = meshes.getptr(h.get("mesh", ""));
@@ -1053,31 +1064,57 @@ void BlenderLink::_apply_object(const String &p_name, const Dictionary &h) {
 		if (mi->get_mesh() != want) {
 			mi->set_mesh(want);
 		}
-		mi->set_cast_shadows_setting(bool(h.get("shadow", true)) ? GeometryInstance3D::SHADOW_CASTING_SETTING_ON
-																  : GeometryInstance3D::SHADOW_CASTING_SETTING_OFF);
+		GeometryInstance3D::ShadowCastingSetting sh = bool(h.get("shadow", true)) ? GeometryInstance3D::SHADOW_CASTING_SETTING_ON
+																				 : GeometryInstance3D::SHADOW_CASTING_SETTING_OFF;
+		if (mi->get_cast_shadows_setting() != sh) {
+			mi->set_cast_shadows_setting(sh);
+		}
 		collision_dirty.insert(key);
 	} else if (Light3D *l = Object::cast_to<Light3D>(node)) {
-		l->set_color(to_color(h.get("color", Variant())));
-		l->set_param(Light3D::PARAM_ENERGY, h.get("energy", 1.0));
-		l->set_shadow(h.get("shadow", true));
-		if (OmniLight3D *o = Object::cast_to<OmniLight3D>(l)) {
-			o->set_param(Light3D::PARAM_RANGE, h.get("range", 10.0));
-		} else if (SpotLight3D *s = Object::cast_to<SpotLight3D>(l)) {
-			s->set_param(Light3D::PARAM_RANGE, h.get("range", 10.0));
-			s->set_param(Light3D::PARAM_SPOT_ANGLE, h.get("spot_angle", 45.0));
-			s->set_param(Light3D::PARAM_SPOT_ATTENUATION, h.get("spot_attenuation", 1.0));
+		auto param = [l](Light3D::Param p, double v) {
+			if (!Math::is_equal_approx(double(l->get_param(p)), v)) {
+				l->set_param(p, v);
+			}
+		};
+		Color col = to_color(h.get("color", Variant()));
+		if (!l->get_color().is_equal_approx(col)) {
+			l->set_color(col);
+		}
+		param(Light3D::PARAM_ENERGY, h.get("energy", 1.0));
+		bool shadow = h.get("shadow", true);
+		if (l->has_shadow() != shadow) {
+			l->set_shadow(shadow);
+		}
+		if (Object::cast_to<OmniLight3D>(l) || Object::cast_to<SpotLight3D>(l)) {
+			param(Light3D::PARAM_RANGE, h.get("range", 10.0));
+		}
+		if (Object::cast_to<SpotLight3D>(l)) {
+			param(Light3D::PARAM_SPOT_ANGLE, h.get("spot_angle", 45.0));
+			param(Light3D::PARAM_SPOT_ATTENUATION, h.get("spot_attenuation", 1.0));
 		}
 	} else if (Camera3D *c = Object::cast_to<Camera3D>(node)) {
-		c->set_keep_aspect_mode(String(h.get("fit", "width")) == "width" ? Camera3D::KEEP_WIDTH : Camera3D::KEEP_HEIGHT);
-		if (String(h.get("projection", "persp")) == "ortho") {
-			c->set_projection(Camera3D::PROJECTION_ORTHOGONAL);
-			c->set_size(h.get("size", 10.0));
-		} else {
-			c->set_projection(Camera3D::PROJECTION_PERSPECTIVE);
-			c->set_fov(h.get("fov", 75.0));
+		Camera3D::KeepAspect ka = String(h.get("fit", "width")) == "width" ? Camera3D::KEEP_WIDTH : Camera3D::KEEP_HEIGHT;
+		if (c->get_keep_aspect_mode() != ka) {
+			c->set_keep_aspect_mode(ka);
 		}
-		c->set_near(h.get("near", 0.05));
-		c->set_far(h.get("far", 1000.0));
+		bool ortho = String(h.get("projection", "persp")) == "ortho";
+		Camera3D::ProjectionType pt = ortho ? Camera3D::PROJECTION_ORTHOGONAL : Camera3D::PROJECTION_PERSPECTIVE;
+		if (c->get_projection() != pt) {
+			c->set_projection(pt);
+		}
+		double size = h.get("size", 10.0), fov = h.get("fov", 75.0), near_v = h.get("near", 0.05), far_v = h.get("far", 1000.0);
+		if (ortho && !Math::is_equal_approx(double(c->get_size()), size)) {
+			c->set_size(size);
+		}
+		if (!ortho && !Math::is_equal_approx(double(c->get_fov()), fov)) {
+			c->set_fov(fov);
+		}
+		if (!Math::is_equal_approx(double(c->get_near()), near_v)) {
+			c->set_near(near_v);
+		}
+		if (!Math::is_equal_approx(double(c->get_far()), far_v)) {
+			c->set_far(far_v);
+		}
 	}
 	(void)created;
 	scene_changed = true;

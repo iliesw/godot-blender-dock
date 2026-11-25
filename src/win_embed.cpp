@@ -448,6 +448,18 @@ void WinEmbed::focus_godot() {
 	SetForegroundWindow(GetAncestor(H(parent_), GA_ROOT));
 }
 
+void WinEmbed::update_priority(bool p_godot_active) {
+	if (!process_) {
+		return;
+	}
+	int want = p_godot_active ? 0 : 1;
+	if (want == priority_state_) {
+		return;
+	}
+	priority_state_ = want;
+	SetPriorityClass(process_, p_godot_active ? BELOW_NORMAL_PRIORITY_CLASS : NORMAL_PRIORITY_CLASS);
+}
+
 bool WinEmbed::cursor_over_blender(int &r_x, int &r_y) {
 	POINT pt;
 	GetCursorPos(&pt);

@@ -92,6 +92,7 @@ class Link:
     parent_hwnd = 0
     godot_died = False
     quitting = False
+    obj_sent = {}  # object name -> last header sent (change-only protocol)
     follow = False
     last_view_sent = None
     next_view_send = 0.0
@@ -162,6 +163,7 @@ def _try_connect():
 
 def _reset_sync():
     L.full_sync = True
+    L.obj_sent.clear()
     L.last_names = None
     L.last_sel = None
     L.mesh_topo.clear()
@@ -559,8 +561,12 @@ def _send_mesh_from(key, me, slots, now):
             surfaces.append({"nv": s["nv"], "ni": s["ni"], "off": off, "len": len(data), "tan": False})
             chunks.append(data)
             off += len(data)
-        _send({"t": "mesh", "key": key, "surfaces": surfaces, "pos_only": True}, b"".join(chunks))
-        L.mesh_settle[key] = now + 0.6  # full refresh (tangents) when editing pauses
+        blob = b"".join(chunks)
+        digest = hashlib.blake2b(blob, digest_size=16).digest()
+        if L.mesh_hash.get(key) != digest:  # selection / material-only updates do not move vertices
+            L.mesh_hash[key] = digest
+            _send({"t": "mesh", "key": key, "surfaces": surfaces, "pos_only": True}, blob)
+            L.mesh_settle[key] = now + 0.6  # full refresh (tangents) when editing pauses
     else:
         d = _extract_full(me, cv)
         if d is None:
@@ -753,6 +759,15 @@ def _collection_tree():
     return out
 
 
+def _send_obj(h):
+    """Send an object header only if it differs from what Godot already has."""
+    key = json.dumps(h, sort_keys=True, separators=(",", ":"))
+    if L.obj_sent.get(h["name"]) == key:
+        return
+    L.obj_sent[h["name"]] = key
+    _send(h)
+
+
 def _send_collections():
     for name, parent, visible in _collection_tree():
         _send({"t": "coll", "name": name, "parent": parent, "visible": visible})
@@ -882,7 +897,7 @@ def _tick():
                 if ob.type in GEOMETRY_TYPES:
                     _send_object_mesh(ob, depsgraph, now, force=True)
             for ob in objs:
-                _send(_object_header(ob, synced))
+                _send_obj(_object_header(ob, synced))
             L.dirty_geo.clear()
             L.dirty_obj.clear()
             L.dirty_mat.clear()
@@ -911,10 +926,10 @@ def _tick():
             for name in list(L.dirty_obj):
                 ob = by_name.get(name)
                 if ob is not None and now >= L.remote_xform_until.get(name, 0.0):
-                    _send(_object_header(ob, synced))
+                    _send_obj(_object_header(ob, synced))
                     for child in ob.children:
                         if child.name in synced:
-                            _send(_object_header(child, synced))
+                            _send_obj(_object_header(child, synced))
             L.dirty_obj.clear()
 
         _settle_meshes(now)
