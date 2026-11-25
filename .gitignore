@@ -1,0 +1,10 @@
+godot-cpp/
+*.obj
+*.lib
+*.exp
+.sconsign.dblite
+demo/.godot/
+tests/*.png
+tests/*.log
+extension_api.json
+*.pyc
