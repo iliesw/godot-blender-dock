@@ -52,6 +52,15 @@ bool any_button_down() {
 
 } // namespace
 
+bool this_process_is_foreground() {
+	HWND fg = GetForegroundWindow();
+	DWORD pid = 0;
+	if (fg) {
+		GetWindowThreadProcessId(fg, &pid);
+	}
+	return pid == GetCurrentProcessId();
+}
+
 bool extract_exe_icon_rgba(const std::wstring &exe, int size, std::vector<uint8_t> &r_rgba) {
 	HICON icon = nullptr;
 	if (SHDefExtractIconW(exe.c_str(), 0, 0, &icon, nullptr, MAKELONG(size, size)) != S_OK || !icon) {
@@ -293,6 +302,9 @@ void WinEmbed::set_visible(bool visible) {
 	}
 	visible_ = visible;
 	ShowWindowAsync(H(hwnd_), visible ? SW_SHOWNA : SW_HIDE);
+	if (visible) {
+		shown_at_ = GetTickCount64();
+	}
 }
 
 void WinEmbed::attach_input(bool attach) {
@@ -316,9 +328,30 @@ bool WinEmbed::blender_has_focus() {
 	return f && (f == H(hwnd_) || IsChild(H(hwnd_), f));
 }
 
-bool WinEmbed::check_responsive(unsigned timeout_ms) {
-	DWORD_PTR res = 0;
-	return SendMessageTimeoutW(H(hwnd_), WM_NULL, 0, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK, timeout_ms, &res) != 0;
+// Global, not a member: a reply may arrive after the plugin (and its WinEmbed) is gone.
+static uint64_t g_probe_replied = 0;
+
+void __stdcall WinEmbed::probe_reply(void *, unsigned, uintptr_t, intptr_t) {
+	g_probe_replied = GetTickCount64();
+}
+
+void WinEmbed::probe_responsiveness() {
+	uint64_t now = GetTickCount64();
+	probe_replied_ = g_probe_replied;
+	bool waiting = probe_sent_ > probe_replied_;
+	if (waiting) {
+		busy_ = now - probe_sent_ > 300; // no answer for 300 ms: Blender's UI thread is stuck
+	} else {
+		busy_ = false;
+	}
+	if (!waiting && now >= next_probe_) {
+		next_probe_ = now + 200;
+		probe_sent_ = now;
+		if (!SendMessageCallbackW(H(hwnd_), WM_NULL, 0, 0, reinterpret_cast<SENDASYNCPROC>(&WinEmbed::probe_reply),
+					0)) {
+			g_probe_replied = now;
+		}
+	}
 }
 
 void WinEmbed::focus_blender() {
@@ -326,8 +359,13 @@ void WinEmbed::focus_blender() {
 		return;
 	}
 	// Never share input with a frozen Blender: Godot's own input would freeze with it.
-	if (busy_ || IsHungAppWindow(H(hwnd_)) || !check_responsive(30)) {
-		busy_ = true;
+	if (busy_ || IsHungAppWindow(H(hwnd_))) {
+		return;
+	}
+	// Handing focus over is synchronous with Blender's UI thread. Wait until a freshly shown
+	// window has redrawn and Blender answered a recent probe, so Godot never stalls on it.
+	uint64_t now = GetTickCount64();
+	if (now - shown_at_ < 250 || probe_sent_ > probe_replied_) {
 		return;
 	}
 	// Share the input queue only while Blender owns the keyboard, so a busy Blender
@@ -342,15 +380,17 @@ void WinEmbed::focus_blender() {
 }
 
 void WinEmbed::focus_godot() {
+	bool was_attached = input_attached_;
+	// Detach first: then SetFocus stays inside Godot's own thread and never waits on Blender.
+	attach_input(false);
 	if (!parent_) {
-		attach_input(false);
 		return;
 	}
-	if (input_attached_ && hwnd_) {
+	SetFocus(H(parent_));
+	if (was_attached && hwnd_) {
+		PostMessageW(H(hwnd_), WM_KILLFOCUS, reinterpret_cast<WPARAM>(H(parent_)), 0);
 		PostMessageW(H(hwnd_), WM_ACTIVATE, WA_INACTIVE, 0);
 	}
-	SetFocus(H(parent_));
-	attach_input(false);
 }
 
 bool WinEmbed::cursor_over_blender(int &r_x, int &r_y) {
@@ -371,21 +411,12 @@ void WinEmbed::update_focus(bool follow_mouse, bool godot_text_focused) {
 		return; // another app (or a Godot dialog / Blender preferences window) is in front
 	}
 	// Hang guard: while input is shared, a frozen Blender would freeze Godot's input too.
-	uint64_t tick = GetTickCount64();
-	if (tick >= next_busy_check_) {
-		next_busy_check_ = tick + (input_attached_ || busy_ ? 250 : 1000);
-		bool responsive = !IsHungAppWindow(H(hwnd_)) && check_responsive(input_attached_ ? 60 : 15);
-		if (!responsive) {
-			if (!busy_ && input_attached_) {
-				attach_input(false); // detach first, then Godot can take its keyboard back
-				SetFocus(H(parent_));
-			}
-			busy_ = true;
-			return;
-		}
-		busy_ = false;
-	}
+	probe_responsiveness();
 	if (busy_) {
+		if (input_attached_) {
+			attach_input(false); // detach first, then Godot can take its keyboard back
+			SetFocus(H(parent_));
+		}
 		return;
 	}
 
@@ -399,12 +430,17 @@ void WinEmbed::update_focus(bool follow_mouse, bool godot_text_focused) {
 
 	if (over_blender) {
 		godot_hover_since_ = 0;
-		if (!has && (pressed || (follow_mouse && !buttons && !godot_text_focused))) {
+		pending_click_ = pending_click_ || pressed; // focus may be deferred a few frames; keep the click
+		if (!has && (pending_click_ || (follow_mouse && !buttons && !godot_text_focused))) {
 			focus_blender();
+		}
+		if (blender_has_focus()) {
+			pending_click_ = false;
 		}
 		return;
 	}
 
+	pending_click_ = false;
 	if (!has) {
 		return;
 	}

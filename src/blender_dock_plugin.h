@@ -135,6 +135,12 @@ private:
 	int selftest_step = -1;
 	double selftest_time = 0.0;
 	void _self_test(double p_delta);
+	void _process_inner(double p_delta);
+	void _perf_test(double p_delta, uint64_t p_cost_us);
+	int perf_step = -1;
+	double perf_time = 0.0, perf_max_gap = 0.0, perf_sum_gap = 0.0;
+	int perf_frames = 0;
+	uint64_t perf_max_cost = 0;
 };
 
 } // namespace godot

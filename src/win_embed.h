@@ -13,6 +13,9 @@ struct EmbedRect {
 	bool operator!=(const EmbedRect &o) const { return !(*this == o); }
 };
 
+// True when the foreground window belongs to this (Godot) process.
+bool this_process_is_foreground();
+
 // Reads the icon embedded in an .exe at the requested pixel size, as tightly packed RGBA8.
 bool extract_exe_icon_rgba(const std::wstring &exe, int size, std::vector<uint8_t> &r_rgba);
 
@@ -68,7 +71,13 @@ private:
 	EmbedRect last_rect_;
 	uint64_t godot_hover_since_ = 0;
 	bool prev_buttons_ = false;
+	bool pending_click_ = false;
 	bool busy_ = false;
-	uint64_t next_busy_check_ = 0;
-	bool check_responsive(unsigned timeout_ms);
+	// Non-blocking hang probe: WM_NULL via SendMessageCallback, answered on Godot's message pump.
+	uint64_t probe_sent_ = 0;
+	uint64_t probe_replied_ = 0;
+	uint64_t next_probe_ = 0;
+	uint64_t shown_at_ = 0; // let Blender redraw a freshly revealed window before handing it focus
+	void probe_responsiveness();
+	static void __stdcall probe_reply(void *hwnd, unsigned msg, uintptr_t data, intptr_t result);
 };

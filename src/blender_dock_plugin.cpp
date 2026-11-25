@@ -382,6 +382,9 @@ void BlenderDockPlugin::_enter_tree() {
 		callable_mp(this, &BlenderDockPlugin::_on_launch_pressed).call_deferred();
 		pending_auto_link = env_auto;
 	}
+	if (OS::get_singleton()->get_environment("BLENDER_DOCK_PERFTEST") == "1") {
+		perf_step = 0;
+	}
 	if (OS::get_singleton()->get_environment("BLENDER_DOCK_SELFTEST") == "1") {
 		selftest_step = 0;
 	}
@@ -545,6 +548,62 @@ void BlenderDockPlugin::_update_ui() {
 // ---------------------------------------------------------------------------- loop
 
 void BlenderDockPlugin::_process(double p_delta) {
+	uint64_t perf_t0 = Time::get_singleton()->get_ticks_usec();
+	_process_inner(p_delta);
+	if (perf_step >= 0) {
+		_perf_test(p_delta, Time::get_singleton()->get_ticks_usec() - perf_t0);
+	}
+}
+
+// BLENDER_DOCK_PERFTEST=1: flip between the 3D and Blender screens and log frame gaps / plugin cost.
+void BlenderDockPlugin::_perf_test(double p_delta, uint64_t p_cost_us) {
+	EditorInterface *ei = EditorInterface::get_singleton();
+	if (perf_step == 0) {
+		if (link->is_peer_connected() && embed->has_window() && link->get_object_count() >= 3) {
+			OS::get_singleton()->set_low_processor_usage_mode(false); // continuous frames: gaps = stalls
+			perf_step = 1;
+			perf_time = 0;
+			ei->set_main_screen_editor("Blender");
+		}
+		return;
+	}
+	perf_time += p_delta;
+	perf_frames++;
+	perf_max_gap = MAX(perf_max_gap, p_delta);
+	perf_sum_gap += p_delta;
+	perf_max_cost = MAX(perf_max_cost, p_cost_us);
+	if (perf_time > 1.5) {
+		UtilityFunctions::print(vformat("PERF phase %d (%s): frames %d, avg %.1f ms, worst gap %.1f ms, worst plugin cost %.2f ms",
+				perf_step, main_visible ? "Blender" : "3D", perf_frames, 1000.0 * perf_sum_gap / MAX(1, perf_frames),
+				1000.0 * perf_max_gap, perf_max_cost / 1000.0));
+		perf_frames = 0;
+		perf_max_gap = perf_sum_gap = 0;
+		perf_max_cost = 0;
+		perf_time = 0;
+		perf_step++;
+		if (perf_step > 10) {
+			UtilityFunctions::print("PERF done");
+			OS::get_singleton()->set_low_processor_usage_mode(true);
+			perf_step = -1;
+			return;
+		}
+		ei->set_main_screen_editor((perf_step % 2) ? "Blender" : "3D");
+	}
+}
+
+void BlenderDockPlugin::_process_inner(double p_delta) {
+	// Giving Blender the keyboard sends Godot a focus-out, and Godot then throttles the editor to
+	// its "unfocused" rate (10 fps by default) until the window is re-activated, which never
+	// happens for a child window. Keep normal pacing whenever Godot's own window is in front.
+	if (embed->is_embedded() && this_process_is_foreground()) {
+		Ref<EditorSettings> es = EditorInterface::get_singleton()->get_editor_settings();
+		int focused_usec = es->has_setting("interface/editor/low_processor_mode_sleep_usec")
+				? int(es->get_setting("interface/editor/low_processor_mode_sleep_usec"))
+				: 6900;
+		if (OS::get_singleton()->get_low_processor_usage_mode_sleep_usec() != focused_usec) {
+			OS::get_singleton()->set_low_processor_usage_mode_sleep_usec(focused_usec);
+		}
+	}
 	if (link.is_valid()) {
 		link->poll(sync_enabled);
 		if (link->take_just_connected()) {
