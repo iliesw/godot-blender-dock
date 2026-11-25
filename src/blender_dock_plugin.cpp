@@ -17,6 +17,8 @@
 #include <godot_cpp/classes/image.hpp>
 #include <godot_cpp/classes/image_texture.hpp>
 #include <godot_cpp/classes/os.hpp>
+#include <godot_cpp/classes/performance.hpp>
+#include <godot_cpp/classes/rendering_server.hpp>
 #include <godot_cpp/classes/project_settings.hpp>
 #include <godot_cpp/classes/sub_viewport.hpp>
 #include <godot_cpp/classes/text_edit.hpp>
@@ -795,17 +797,37 @@ void BlenderDockPlugin::_perf_test(double p_delta, uint64_t p_cost_us) {
 // Diagnostics: any frame gap over 50 ms is written to user://blender_dock_hitches.log together
 // with the previous frame's plugin section times and who had focus, so lag reports have data.
 void BlenderDockPlugin::_log_hitch(double p_delta) {
-	if (!bool(_setting(S_HITCH_LOG, true)) || !embed->is_running() || !blender_ready || p_delta < 0.05) {
+	if (!bool(_setting(S_HITCH_LOG, true)) || !embed->is_running() || !blender_ready) {
+		return;
+	}
+	RenderingServer *rs = RenderingServer::get_singleton();
+	// Measure Godot's own render cost for the editor window and the 3D viewport.
+	Viewport *root_vp = EditorInterface::get_singleton()->get_base_control()->get_viewport();
+	SubViewport *vp3d = EditorInterface::get_singleton()->get_editor_viewport_3d(0);
+	if (!render_measure_on && root_vp) {
+		rs->viewport_set_measure_render_time(root_vp->get_viewport_rid(), true);
+		if (vp3d) {
+			rs->viewport_set_measure_render_time(vp3d->get_viewport_rid(), true);
+		}
+		render_measure_on = true;
+	}
+	if (p_delta < 0.05) {
 		return;
 	}
 	String who = embed->blender_has_focus() ? "Blender" : (this_process_is_foreground() ? "Godot" : "other app");
 	if (who == "other app" && !unfocused_overridden) {
-		return; // throttling while another app is active is normal; not a lag
+		return;
 	}
-	String line = vformat("%s gap %.0f ms | focus %s | screen %s | plugin ms: link %.1f find %.1f embed %.1f rect %.1f focus %.1f msgs %.1f ui %.1f",
+	double proc_ms = Performance::get_singleton()->get_monitor(Performance::TIME_PROCESS) * 1000.0;
+	double ui_cpu = root_vp ? rs->viewport_get_measured_render_time_cpu(root_vp->get_viewport_rid()) : 0.0;
+	double ui_gpu = root_vp ? rs->viewport_get_measured_render_time_gpu(root_vp->get_viewport_rid()) : 0.0;
+	double v3_cpu = vp3d ? rs->viewport_get_measured_render_time_cpu(vp3d->get_viewport_rid()) : 0.0;
+	double v3_gpu = vp3d ? rs->viewport_get_measured_render_time_gpu(vp3d->get_viewport_rid()) : 0.0;
+	double setup = rs->get_frame_setup_time_cpu();
+	String line = vformat("%s gap %.0f ms | focus %s | screen %s | plugin %.1f ms | godot process %.1f ms | render cpu ui %.1f 3d %.1f setup %.1f | gpu ui %.1f 3d %.1f | mouse %s",
 			Time::get_singleton()->get_time_string_from_system(), p_delta * 1000.0, who, main_visible ? "Blender" : "other",
-			frame_sec[0] / 1000.0, frame_sec[1] / 1000.0, frame_sec[2] / 1000.0, frame_sec[3] / 1000.0, frame_sec[4] / 1000.0,
-			frame_sec[5] / 1000.0, frame_sec[6] / 1000.0);
+			(frame_sec[0] + frame_sec[1] + frame_sec[2] + frame_sec[3] + frame_sec[4] + frame_sec[5] + frame_sec[6]) / 1000.0,
+			proc_ms, ui_cpu, v3_cpu, setup, ui_gpu, v3_gpu, embed->mouse_location());
 	String path = OS::get_singleton()->get_user_data_dir().path_join("blender_dock_hitches.log");
 	Ref<FileAccess> f = FileAccess::file_exists(path) ? FileAccess::open(path, FileAccess::READ_WRITE) : FileAccess::open(path, FileAccess::WRITE);
 	if (f.is_valid()) {

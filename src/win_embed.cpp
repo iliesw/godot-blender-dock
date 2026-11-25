@@ -460,6 +460,24 @@ void WinEmbed::update_priority(bool p_godot_active) {
 	SetPriorityClass(process_, p_godot_active ? BELOW_NORMAL_PRIORITY_CLASS : NORMAL_PRIORITY_CLASS);
 }
 
+const char *WinEmbed::mouse_location() {
+	int x, y;
+	bool down = any_button_down();
+	if (cursor_over_blender(x, y)) {
+		return down ? "over Blender, button down" : "over Blender";
+	}
+	POINT pt = { x, y };
+	HWND w = WindowFromPoint(pt);
+	DWORD pid = 0;
+	if (w) {
+		GetWindowThreadProcessId(w, &pid);
+	}
+	if (pid == GetCurrentProcessId()) {
+		return down ? "over Godot, button down" : "over Godot";
+	}
+	return down ? "elsewhere, button down" : "elsewhere";
+}
+
 bool WinEmbed::cursor_over_blender(int &r_x, int &r_y) {
 	POINT pt;
 	GetCursorPos(&pt);

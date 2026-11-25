@@ -62,6 +62,7 @@ public:
 	// godot_text_focused: Godot has a text field focused -> do not steal focus on hover.
 	void update_focus(bool follow_mouse, bool godot_text_focused);
 	bool blender_has_focus();
+	const char *mouse_location(); // over Blender / over Godot / elsewhere (+ button down)
 	void focus_godot();
 	// Below-normal CPU priority while Godot is the active window, so Blender bursts never starve the editor.
 	void update_priority(bool p_godot_active);
