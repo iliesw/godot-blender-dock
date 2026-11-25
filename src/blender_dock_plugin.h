@@ -158,6 +158,9 @@ private:
 	uint64_t perf_sec[8] = {};
 	uint64_t frame_sec[8] = {};
 	void _log_hitch(double p_delta);
+	void _sync_unfocused_speed();
+	void _restore_unfocused_speed();
+	bool unfocused_overridden = false;
 };
 
 } // namespace godot

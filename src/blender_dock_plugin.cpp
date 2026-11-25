@@ -351,6 +351,7 @@ void BlenderDockPlugin::_build_settings() {
 
 void BlenderDockPlugin::_enter_tree() {
 	_ensure_settings();
+	_restore_unfocused_speed();
 
 	_build_panel(main_panel);
 	EditorInterface::get_singleton()->get_editor_main_screen()->add_child(main_panel.root);
@@ -417,6 +418,7 @@ void BlenderDockPlugin::_enter_tree() {
 
 void BlenderDockPlugin::_exit_tree() {
 	set_process(false);
+	_restore_unfocused_speed();
 	EditorSelection *sel = EditorInterface::get_singleton()->get_selection();
 	if (sel && sel->is_connected("selection_changed", Callable(this, "_on_selection_changed"))) {
 		sel->disconnect("selection_changed", Callable(this, "_on_selection_changed"));
@@ -751,6 +753,9 @@ void BlenderDockPlugin::_log_hitch(double p_delta) {
 		return;
 	}
 	String who = embed->blender_has_focus() ? "Blender" : (this_process_is_foreground() ? "Godot" : "other app");
+	if (who == "other app" && !unfocused_overridden) {
+		return; // throttling while another app is active is normal; not a lag
+	}
 	String line = vformat("%s gap %.0f ms | focus %s | screen %s | plugin ms: link %.1f find %.1f embed %.1f rect %.1f focus %.1f msgs %.1f ui %.1f",
 			Time::get_singleton()->get_time_string_from_system(), p_delta * 1000.0, who, main_visible ? "Blender" : "other",
 			frame_sec[0] / 1000.0, frame_sec[1] / 1000.0, frame_sec[2] / 1000.0, frame_sec[3] / 1000.0, frame_sec[4] / 1000.0,
@@ -763,20 +768,51 @@ void BlenderDockPlugin::_log_hitch(double p_delta) {
 	}
 }
 
+// While Blender runs next to it, Godot is "unfocused" whenever Blender (or anything else) is the
+// active window, and the editor then throttles itself to unfocused_low_processor_mode_sleep_usec
+// (100 ms = 10 fps by default). Every hand-over between the 3D view and Blender went through
+// those throttled frames. So while Blender is running, the unfocused speed equals the normal
+// speed; the user's value is saved and restored when Blender stops or the plugin unloads.
+static const char *UNFOCUSED_KEY = "interface/editor/timers/unfocused_low_processor_mode_sleep_usec"; // Godot 4.7 path
+static const char *FOCUSED_KEY = "interface/editor/timers/low_processor_mode_sleep_usec";
+static const char *SAVED_UNFOCUSED_KEY = "blender_dock/saved_unfocused_sleep_usec";
+
+void BlenderDockPlugin::_sync_unfocused_speed() {
+	Ref<EditorSettings> es = EditorInterface::get_singleton()->get_editor_settings();
+	if (es.is_null() || !es->has_setting(UNFOCUSED_KEY)) {
+		return;
+	}
+	bool want = embed->is_running();
+	if (want == unfocused_overridden) {
+		return;
+	}
+	int focused = es->has_setting(FOCUSED_KEY) ? int(es->get_setting(FOCUSED_KEY)) : 6900;
+	if (want) {
+		if (!es->has_setting(SAVED_UNFOCUSED_KEY)) { // keep the original across crashes
+			es->set_setting(SAVED_UNFOCUSED_KEY, es->get_setting(UNFOCUSED_KEY));
+		}
+		es->set_setting(UNFOCUSED_KEY, focused);
+		OS::get_singleton()->set_low_processor_usage_mode_sleep_usec(focused);
+	} else {
+		_restore_unfocused_speed();
+	}
+	unfocused_overridden = want;
+}
+
+void BlenderDockPlugin::_restore_unfocused_speed() {
+	Ref<EditorSettings> es = EditorInterface::get_singleton()->get_editor_settings();
+	if (es.is_null() || !es->has_setting(SAVED_UNFOCUSED_KEY)) {
+		return;
+	}
+	es->set_setting(UNFOCUSED_KEY, es->get_setting(SAVED_UNFOCUSED_KEY));
+	es->erase(SAVED_UNFOCUSED_KEY);
+	unfocused_overridden = false;
+}
+
 void BlenderDockPlugin::_process_inner(double p_delta) {
 	uint64_t _perf_t = Time::get_singleton()->get_ticks_usec();
-	// Giving Blender the keyboard sends Godot a focus-out, and Godot then throttles the editor to
-	// its "unfocused" rate (10 fps by default) until the window is re-activated, which never
-	// happens for a child window. Keep normal pacing whenever Godot's own window is in front.
-	if (embed->is_embedded() && (this_process_is_foreground() || embed->blender_has_focus())) {
-		Ref<EditorSettings> es = EditorInterface::get_singleton()->get_editor_settings();
-		int focused_usec = es->has_setting("interface/editor/low_processor_mode_sleep_usec")
-				? int(es->get_setting("interface/editor/low_processor_mode_sleep_usec"))
-				: 6900;
-		if (OS::get_singleton()->get_low_processor_usage_mode_sleep_usec() != focused_usec) {
-			OS::get_singleton()->set_low_processor_usage_mode_sleep_usec(focused_usec);
-		}
-	}
+	_sync_unfocused_speed();
+
 	if (link.is_valid()) {
 		link->poll(sync_enabled);
 		if (link->take_just_connected()) {
