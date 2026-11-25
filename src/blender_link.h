@@ -5,7 +5,7 @@
 //   u32 frame_len | u32 header_len | header (UTF-8 JSON) | blob (frame_len - 4 - header_len bytes)
 //
 // Blender -> Godot
-//   hello {file, blender}
+//   hello {token, file, blender}   must be the first frame; wrong/missing token -> connection dropped
 //   coll  {name, parent, visible}                          collection -> Node3D
 //   obj   {name, kind, parent, xform[12] (local), visible, mesh, col, colonly, light/camera params}
 //   mesh  {key, pos_only, surfaces:[{nv, ni, off, len, tan, mat, uv, uv2, col}]}
@@ -17,7 +17,7 @@
 //   sel   {names, active}
 //   baked {ok, path | msg}
 // Godot -> Blender
-//   sync, open {path}, save {path}, quit, sel {names, active}, xform {name, xform (relative to BlenderLink)},
+//   sync {token} (first frame, proves this is the Godot that launched Blender), open {path}, save {path}, quit, sel {names, active}, xform {name, xform (relative to BlenderLink)},
 //   view {xform, fov, ortho, size, distance}, chrome {docked}, embedded {hwnd, parent}, bake {dir}
 //
 // Parent keys: "" = BlenderLink root, "o:<object>", "c:<collection>". Node keys add "i:<instance group>".
@@ -44,7 +44,10 @@ public:
 	static constexpr const char *NAME_META = "blender_name"; // node key, e.g. "o:Cube"
 	static constexpr const char *MODE_META = "blender_link_mode"; // "preview" (default) or "scene"
 
-	Error start(int p_port);
+	// Listens on p_port, or the next free port (up to p_tries ports). get_port() gives the one in use.
+	Error start(int p_port, int p_tries = 32);
+	// Random per-editor-session secret, passed to Blender on its command line.
+	String get_token();
 	void stop();
 
 	// Network + scene sync. Call every editor tick.
@@ -118,6 +121,8 @@ private:
 	static constexpr uint64_t FRAME_BUDGET_USEC = 4000; // max time per editor frame applying Blender data
 
 	void _read_peer();
+	void _poll_pending();
+	void _adopt(const Ref<StreamPeerTCP> &p_peer);
 	void _handle_frame(const Dictionary &p_header, const uint8_t *p_blob, int64_t p_blob_len);
 
 	void _on_material(const Dictionary &h);
@@ -147,6 +152,12 @@ private:
 
 	Ref<TCPServer> server;
 	Ref<StreamPeerTCP> peer;
+	// A new connection waits here until its hello carries the token (a stranger cannot
+	// replace or talk to the live Blender).
+	Ref<StreamPeerTCP> pending;
+	PackedByteArray pending_buf;
+	uint64_t pending_deadline = 0;
+	String token;
 	int port = 6789;
 	bool just_connected = false;
 	bool scene_received = false;

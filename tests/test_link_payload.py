@@ -96,7 +96,7 @@ tree.links.new(ico.outputs["Mesh"], inst.inputs["Instance"])
 tree.links.new(inst.outputs[0], go.inputs[0])
 gn.node_group = tree
 
-sys.argv += ["--", "--godot-port", str(port)]
+sys.argv += ["--", "--godot-port", str(port), "--godot-token", "t0ken"]
 ns = {"__name__": "godot_link"}
 src = os.path.join(os.path.dirname(__file__), "..", "demo", "addons", "blender_dock", "blender", "godot_link.py")
 exec(open(src).read(), ns)
@@ -145,6 +145,7 @@ check(objs["Crate-col"]["col"] == "trimesh", "crate collision from suffix")
 check(any(h["t"] == "inst" and h["count"] == 4 for h, _ in frames), "4 GN instances on plane")
 check(any(h["t"] == "mat" and h["name"] == "Rock" and h.get("normal_tex") for h, _ in frames), "normal map traced")
 
+frames0 = list(frames)
 # --- move a vertex: should come back as a position-only update
 frames.clear()
 monkey.data.vertices[0].co.x += 0.5
@@ -157,7 +158,9 @@ time.sleep(0.3)
 upd = [h for h, _ in frames if h["t"] == "mesh" and h["key"] == "Suzanne"]
 check(upd and upd[0]["pos_only"], "vertex move should be pos_only")
 
-# --- Godot -> Blender commands
+# --- Godot -> Blender commands (first frame must prove the token)
+check(any(h["t"] == "hello" and h.get("token") == "t0ken" for h, _ in frames0), "hello carries the token")
+send({"t": "sync", "token": "t0ken"})
 send({"t": "sel", "names": ["Crate-col"], "active": "Crate-col"})
 send({"t": "xform", "name": "Crate-col", "xform": [1, 0, 0, 0, 1, 0, 0, 0, 1, 7, 8, 9]})
 time.sleep(0.2)

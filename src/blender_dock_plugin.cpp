@@ -131,7 +131,7 @@ void BlenderDockPlugin::_ensure_settings() {
 	add(S_BLENDER_PATH, String(), PROPERTY_HINT_GLOBAL_FILE, "*.exe");
 	add(S_PORT, 6789, PROPERTY_HINT_RANGE, "1024,65535,1");
 	add(S_FOLLOW_MOUSE, false, PROPERTY_HINT_NONE, "");
-	add(S_HITCH_LOG, true, PROPERTY_HINT_NONE, "");
+	add(S_HITCH_LOG, false, PROPERTY_HINT_NONE, "");
 	add(S_AUTO_LAUNCH, false, PROPERTY_HINT_NONE, "");
 	add(S_MATCH_THEME, false, PROPERTY_HINT_NONE, "");
 	add(S_HIDE_STATUSBAR, true, PROPERTY_HINT_NONE, "");
@@ -346,6 +346,7 @@ void BlenderDockPlugin::_build_settings() {
 	flag("Look", "Use Godot's colors in Blender (off = Blender's default theme)", s.theme);
 	flag("", "Hide Blender's status bar while docked", s.statusbar);
 	flag("", "Show Blender's splash screen", s.splash);
+	flag("Diagnostics", "Log stalls to user://blender_dock_hitches.log and %TEMP%/blender_dock_link.log", s.hitch);
 
 	s.browse = memnew(EditorFileDialog);
 	s.browse->set_file_mode(EditorFileDialog::FILE_MODE_OPEN_FILE);
@@ -403,6 +404,9 @@ void BlenderDockPlugin::_enter_tree() {
 
 	EditorInterface::get_singleton()->get_selection()->connect("selection_changed", Callable(this, "_on_selection_changed"));
 
+	// The editor crashed while Blender ran last time: put the user's unfocused speed back.
+	_restore_unfocused_speed();
+
 	link.instantiate();
 	link->start(int(_setting(S_PORT, 6789)));
 
@@ -444,7 +448,7 @@ void BlenderDockPlugin::_exit_tree() {
 		if (link->get_blend_file().is_empty()) {
 			ensure_ignored_dir(ProjectSettings::get_singleton()->localize_path(path.get_base_dir()));
 		}
-		if (!link->send_save_quit(path, 2000)) {
+		if (!link->send_save_quit(path, 5000)) {
 			// Blender did not confirm: its watchdog will pop it out as a normal window (nothing lost).
 			UtilityFunctions::print("Blender Dock: Blender will be shown as a normal window instead.");
 		}
@@ -496,7 +500,7 @@ void BlenderDockPlugin::_notification(int p_what) {
 		default:
 			return;
 	}
-	if (!embed || !embed->is_running() || !bool(_setting(S_HITCH_LOG, true))) {
+	if (!embed || !embed->is_running() || !bool(_setting(S_HITCH_LOG, false))) {
 		return;
 	}
 	String who = embed->blender_has_focus() ? "Blender" : (this_process_is_foreground() ? "Godot" : "other app");
@@ -580,7 +584,7 @@ void BlenderDockPlugin::_update_ui() {
 										 : (embed->is_blender_busy() ? String("Blender: busy") : String("Blender: running")));
 	String linkst;
 	if (!link.is_valid() || !link->is_listening()) {
-		linkst = "Link: off (port busy?)";
+		linkst = "Link: off (no free port)";
 	} else if (connected) {
 		linkst = vformat("Link: live, %d objects", link->get_object_count());
 	} else {
@@ -797,7 +801,7 @@ void BlenderDockPlugin::_perf_test(double p_delta, uint64_t p_cost_us) {
 // Diagnostics: any frame gap over 50 ms is written to user://blender_dock_hitches.log together
 // with the previous frame's plugin section times and who had focus, so lag reports have data.
 void BlenderDockPlugin::_log_hitch(double p_delta) {
-	if (!bool(_setting(S_HITCH_LOG, true)) || !embed->is_running() || !blender_ready) {
+	if (!bool(_setting(S_HITCH_LOG, false)) || !embed->is_running() || !blender_ready) {
 		return;
 	}
 	RenderingServer *rs = RenderingServer::get_singleton();
@@ -1179,7 +1183,8 @@ void BlenderDockPlugin::_launch(const String &p_blend) {
 	EmbedRect lr = _launch_rect();
 	args += vformat("--no-window-focus -p %d %d %d %d ", lr.x, lr.y, lr.w, lr.h);
 	args += "--python " + quote(ps->globalize_path(SCRIPT_PATH)) + " --";
-	args += " --godot-port " + itos(int(_setting(S_PORT, 6789)));
+	args += " --godot-port " + itos(link->get_port());
+	args += " --godot-token " + link->get_token();
 	args += " --godot-pid " + itos(OS::get_singleton()->get_process_id());
 	args += " --godot-project " + quote(ps->globalize_path("res://").trim_suffix("/"));
 	int recovery = int(_setting(S_RECOVERY, 30));
@@ -1196,6 +1201,9 @@ void BlenderDockPlugin::_launch(const String &p_blend) {
 		if (es->has_setting("interface/theme/accent_color")) {
 			args += " --godot-accent " + Color(es->get_setting("interface/theme/accent_color")).to_html(false);
 		}
+	}
+	if (bool(_setting(S_HITCH_LOG, false))) {
+		args += " --godot-hitch-log";
 	}
 	if (bool(_setting(S_KEEP_SPLASH, false))) {
 		args += " --godot-keep-splash";
@@ -1353,6 +1361,7 @@ void BlenderDockPlugin::_on_settings_pressed() {
 	s.theme->set_pressed(_setting(S_MATCH_THEME, false));
 	s.statusbar->set_pressed(_setting(S_HIDE_STATUSBAR, true));
 	s.splash->set_pressed(_setting(S_KEEP_SPLASH, false));
+	s.hitch->set_pressed(_setting(S_HITCH_LOG, false));
 	s.dialog->popup_centered();
 }
 
@@ -1376,6 +1385,7 @@ void BlenderDockPlugin::_on_settings_confirmed() {
 	es->set_setting(S_MATCH_THEME, s.theme->is_pressed());
 	es->set_setting(S_HIDE_STATUSBAR, s.statusbar->is_pressed());
 	es->set_setting(S_KEEP_SPLASH, s.splash->is_pressed());
+	es->set_setting(S_HITCH_LOG, s.hitch->is_pressed());
 	if (int(s.port->get_value()) != old_port) {
 		link->start(int(s.port->get_value()));
 	}

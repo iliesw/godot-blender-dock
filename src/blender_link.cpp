@@ -16,6 +16,7 @@
 #include <godot_cpp/classes/multi_mesh_instance3d.hpp>
 #include <godot_cpp/classes/omni_light3d.hpp>
 #include <godot_cpp/classes/concave_polygon_shape3d.hpp>
+#include <godot_cpp/classes/crypto.hpp>
 #include <godot_cpp/classes/convex_polygon_shape3d.hpp>
 #include <godot_cpp/classes/shape3d.hpp>
 #include <godot_cpp/classes/spot_light3d.hpp>
@@ -103,19 +104,41 @@ BaseMaterial3D::TextureChannel to_channel(const String &c) {
 
 // ---------------------------------------------------------------------------- network
 
-Error BlenderLink::start(int p_port) {
-	stop();
-	port = p_port;
-	server.instantiate();
-	Error err = server->listen(port, "127.0.0.1");
-	if (err != OK) {
-		UtilityFunctions::push_warning("Blender Dock: cannot listen on 127.0.0.1:", port, " (", err, ")");
+String BlenderLink::get_token() {
+	if (token.is_empty()) {
+		Ref<Crypto> c;
+		c.instantiate();
+		token = c->generate_random_bytes(16).hex_encode();
 	}
+	return token;
+}
+
+Error BlenderLink::start(int p_port, int p_tries) {
+	stop();
+	get_token();
+	server.instantiate();
+	Error err = FAILED;
+	for (int i = 0; i < MAX(1, p_tries) && p_port + i <= 65535; i++) {
+		port = p_port + i;
+		err = server->listen(port, "127.0.0.1");
+		if (err == OK) {
+			if (i > 0) {
+				UtilityFunctions::print("Blender Dock: port ", p_port, " is busy, using ", port);
+			}
+			return OK;
+		}
+	}
+	port = p_port;
+	UtilityFunctions::push_warning("Blender Dock: no free port in ", p_port, "-", p_port + p_tries - 1, " (", err, ")");
 	return err;
 }
 
 void BlenderLink::stop() {
 	_preview_clear();
+	if (pending.is_valid()) {
+		pending->disconnect_from_host();
+		pending.unref();
+	}
 	if (peer.is_valid()) {
 		peer->disconnect_from_host();
 		peer.unref();
@@ -197,20 +220,16 @@ void BlenderLink::poll(bool p_sync_enabled) {
 	if (server.is_valid() && server->is_connection_available()) {
 		Ref<StreamPeerTCP> incoming = server->take_connection();
 		if (incoming.is_valid()) {
-			if (peer.is_valid()) {
-				peer->disconnect_from_host(); // newest Blender wins
+			if (pending.is_valid()) {
+				pending->disconnect_from_host();
 			}
-			peer = incoming;
-			peer->set_no_delay(true);
-			inbuf.clear();
-			inbuf_off = 0;
-			just_connected = true;
-			scene_received = false;
-			last_sel.clear();
-			Dictionary d;
-			d["t"] = "sync";
-			send(d);
+			pending = incoming;
+			pending_buf.clear();
+			pending_deadline = now_ms() + 3000;
 		}
+	}
+	if (pending.is_valid()) {
+		_poll_pending();
 	}
 
 	if (peer.is_valid()) {
@@ -247,6 +266,73 @@ void BlenderLink::poll(bool p_sync_enabled) {
 			EditorInterface::get_singleton()->mark_scene_as_unsaved();
 		}
 	}
+}
+
+void BlenderLink::_poll_pending() {
+	pending->poll();
+	if (pending->get_status() != StreamPeerTCP::STATUS_CONNECTED || now_ms() > pending_deadline) {
+		pending->disconnect_from_host();
+		pending.unref();
+		return;
+	}
+	int avail = pending->get_available_bytes();
+	if (avail > 0) {
+		Array r = pending->get_partial_data(MIN(avail, 65536));
+		if (int(r[0]) == OK) {
+			pending_buf.append_array(PackedByteArray(r[1]));
+		}
+	}
+	if (pending_buf.size() < 8) {
+		return;
+	}
+	const uint8_t *d = pending_buf.ptr();
+	uint32_t flen = rd_u32(d);
+	uint32_t hl = rd_u32(d + 4);
+	bool ok = flen >= 4 && flen <= 65536 && hl <= flen - 4;
+	if (ok && int64_t(pending_buf.size()) < 4 + int64_t(flen)) {
+		if (pending_buf.size() > 65536 + 4) {
+			ok = false;
+		} else {
+			return; // hello not complete yet
+		}
+	}
+	if (ok) {
+		Variant hv = JSON::parse_string(String::utf8(reinterpret_cast<const char *>(d + 8), hl));
+		ok = hv.get_type() == Variant::DICTIONARY && String(Dictionary(hv).get("t", "")) == "hello" &&
+				String(Dictionary(hv).get("token", "")) == token;
+	}
+	if (!ok) {
+		UtilityFunctions::push_warning("Blender Dock: rejected a link connection without the session token.");
+		pending->disconnect_from_host();
+		pending.unref();
+		pending_buf.clear();
+		return;
+	}
+	Ref<StreamPeerTCP> p = pending;
+	PackedByteArray buf = pending_buf;
+	pending.unref();
+	pending_buf.clear();
+	_adopt(p);
+	inbuf = buf; // the hello (and anything after it) is handled as normal frames
+	inbuf_off = 0;
+	_read_peer();
+}
+
+void BlenderLink::_adopt(const Ref<StreamPeerTCP> &p_peer) {
+	if (peer.is_valid()) {
+		peer->disconnect_from_host(); // newest (authenticated) Blender wins
+	}
+	peer = p_peer;
+	peer->set_no_delay(true);
+	inbuf.clear();
+	inbuf_off = 0;
+	just_connected = true;
+	scene_received = false;
+	last_sel.clear();
+	Dictionary d;
+	d["t"] = "sync";
+	d["token"] = token;
+	send(d);
 }
 
 void BlenderLink::_read_peer() {

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Godot live link: runs inside Blender (started by the Godot "Blender" dock).
 
 Streams the evaluated scene to the Godot editor over TCP, converted to Godot space
@@ -9,7 +10,8 @@ Streams the evaluated scene to the Godot editor over TCP, converted to Godot spa
   * collision hints (name suffix -col / -colonly / -convcol, or the Godot panel)
 And from Godot: selection, transforms, editor-view follow, save, glTF bake, chrome.
 
-Standalone use:  blender my.blend --python godot_link.py -- --godot-port 6789
+Started by the Godot dock with --godot-port and --godot-token (a per-session secret that
+Godot checks before it accepts the connection, and that Blender checks before it obeys).
 """
 
 import atexit
@@ -44,6 +46,7 @@ def _arg(name, default=None):
 
 
 PORT = int(_arg("--godot-port", os.environ.get("GODOT_LINK_PORT", "6789")))
+TOKEN = _arg("--godot-token", os.environ.get("GODOT_LINK_TOKEN", ""))
 GODOT_PID = int(_arg("--godot-pid", "0"))
 PROJECT_DIR = _arg("--godot-project", "")
 THEME_BASE = _arg("--godot-base", "")
@@ -51,6 +54,7 @@ THEME_ACCENT = _arg("--godot-accent", "")
 RECOVERY_PATH = _arg("--godot-recovery", "")
 RECOVERY_INTERVAL = float(_arg("--godot-recovery-interval", "30"))
 HIDE_STATUSBAR = _arg("--godot-hide-statusbar", "1") == "1"
+HITCH_LOG = "--godot-hitch-log" in ARGV
 
 TICK = 1.0 / 30.0
 SLOW_MESH_SECONDS = 0.012   # extraction slower than this -> mesh gets its own adaptive interval
@@ -97,6 +101,7 @@ class Link:
     follow = False
     last_view_sent = None
     next_view_send = 0.0
+    authed = False  # Godot proved it knows the token (its first frame: sync {token})
 
 
 L = Link()
@@ -138,11 +143,12 @@ def _disconnect():
             pass
     L.sock = None
     L.rx = b""
+    L.authed = False
     L.status = "disconnected"
 
 
 def _hello():
-    _send({"t": "hello", "file": bpy.data.filepath, "blender": bpy.app.version_string})
+    _send({"t": "hello", "token": TOKEN, "file": bpy.data.filepath, "blender": bpy.app.version_string})
 
 
 def _try_connect():
@@ -220,6 +226,13 @@ def _read_commands():
         except ValueError:
             header = {}
         L.rx = L.rx[4 + flen:]
+        if not L.authed:
+            if header.get("t") == "sync" and TOKEN and header.get("token") == TOKEN:
+                L.authed = True
+            else:
+                _log("link: ignored a frame from an unauthenticated server")
+                closed = True
+                break
         if header.get("t") == "view":
             newest_view = header  # Godot may send many; only the newest is applied
             continue
@@ -878,7 +891,7 @@ def _note_blender_hitch():
     now = time.monotonic()
     last = L.last_tick_time
     L.last_tick_time = now
-    if last and now - last > 0.15:
+    if HITCH_LOG and last and now - last > 0.15:
         active = "Blender" if _blender_is_active() else "other"
         _log(f"blender stall {int((now - last) * 1000)} ms | active {active} | docked {L.docked}")
 

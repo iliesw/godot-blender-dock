@@ -10,3 +10,4 @@ extension_api.json
 *.pyc
 tests/sandbox/
 ~*.dll
+dist/

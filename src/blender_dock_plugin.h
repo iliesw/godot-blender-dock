@@ -77,6 +77,7 @@ private:
 		CheckBox *theme = nullptr;
 		CheckBox *statusbar = nullptr;
 		CheckBox *splash = nullptr;
+		CheckBox *hitch = nullptr;
 		EditorFileDialog *browse = nullptr;
 	};
 
