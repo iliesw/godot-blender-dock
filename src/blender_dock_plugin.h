@@ -90,6 +90,8 @@ private:
 	void _ensure_settings();
 	Variant _setting(const String &p_name, const Variant &p_default) const;
 	void _follow_view();
+	void _apply_blender_view();
+	uint64_t next_view_send_ms = 0;
 	void _send_chrome();
 	bool _untint_tab_icon(Node *p_node);
 

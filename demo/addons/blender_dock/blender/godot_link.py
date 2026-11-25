@@ -92,6 +92,9 @@ class Link:
     parent_hwnd = 0
     godot_died = False
     quitting = False
+    follow = False
+    last_view_sent = None
+    next_view_send = 0.0
 
 
 L = Link()
@@ -204,6 +207,7 @@ def _read_commands():
         if L.sock:
             L.sock.settimeout(5.0)
 
+    newest_view = None
     while len(L.rx) >= 8:
         flen, hlen = struct.unpack_from("<II", L.rx, 0)
         if len(L.rx) < 4 + flen:
@@ -213,10 +217,19 @@ def _read_commands():
         except ValueError:
             header = {}
         L.rx = L.rx[4 + flen:]
+        if header.get("t") == "view":
+            newest_view = header  # Godot may send many; only the newest is applied
+            continue
         try:
             _handle_command(header)
         except Exception as e:
             print("[godot_link] command failed:", header.get("t"), e)
+    if newest_view is not None and not _blender_is_active():
+        try:
+            _apply_view(newest_view)
+            L.last_view_sent = _view_key()  # do not echo it back
+        except Exception as e:
+            print("[godot_link] view:", e)
     if closed:
         _disconnect()
 
@@ -244,6 +257,9 @@ def _handle_command(h):
         _apply_xform(h.get("name", ""), h.get("xform", []))
     elif t == "view":
         _apply_view(h)
+    elif t == "follow":
+        L.follow = bool(h.get("on", False))
+        L.last_view_sent = None
     elif t == "chrome":
         L.docked = bool(h.get("docked", True))
         _apply_chrome()
@@ -341,6 +357,42 @@ def _apply_view(h):
         long_fov = 2 * math.atan(math.tan(vfov / 2) * max(aspect, 1.0))
         space.lens = 36.0 / math.tan(long_fov / 2)
     area.tag_redraw()
+
+
+def _blender_is_active():
+    """True when Blender's window is the active one (the user is working in Blender)."""
+    if os.name != "nt":
+        return True
+    try:
+        u32 = ctypes.windll.user32
+        pid = ctypes.c_ulong()
+        u32.GetWindowThreadProcessId(u32.GetForegroundWindow(), ctypes.byref(pid))
+        return pid.value == os.getpid()
+    except Exception:
+        return False
+
+
+def _view_key():
+    area = _largest_view3d()
+    if not area:
+        return None
+    r3d = area.spaces.active.region_3d
+    return tuple(round(v, 4) for row in r3d.view_matrix for v in row)
+
+
+def _send_view_if_changed(now):
+    """Blender -> Godot follow: stream the viewport camera while Blender is the active window."""
+    if not L.follow or now < L.next_view_send or not _blender_is_active():
+        return
+    key = _view_key()
+    if key is None or key == L.last_view_sent:
+        return
+    L.last_view_sent = key
+    L.next_view_send = now + 1.0 / 30.0
+    r3d = _largest_view3d().spaces.active.region_3d
+    cam = r3d.view_matrix.inverted()
+    m = C @ cam @ C_INV @ LOCAL_FIX
+    _send({"t": "view", "xform": _to_list12(m)})
 
 
 def _bake(directory):
@@ -878,6 +930,8 @@ def _tick():
                 msg["instances"] = inst_keys
             _send(msg)
 
+        _send_view_if_changed(now)
+
         sel = _selection_state()
         if sel != L.last_sel:
             L.last_sel = sel
@@ -1172,12 +1226,25 @@ class GODOT_PT_panel(bpy.types.Panel):
             box.prop(ob, "godot_collision_only_prop", text="Collision only (hide mesh)")
 
 
+_keymaps = []
+
+
+def _register_keymaps():
+    kc = bpy.context.window_manager.keyconfigs.addon
+    if kc is None:  # background mode
+        return
+    km = kc.keymaps.new(name="Object Mode", space_type="EMPTY")
+    kmi = km.keymap_items.new("view3d.view_selected", "F", "PRESS")
+    _keymaps.append((km, kmi))
+
+
 def register():
     bpy.types.Object.godot_collision_mode = bpy.props.EnumProperty(
         name="Godot Collision", items=COL_ITEMS, get=_col_get, set=_col_set)
     bpy.types.Object.godot_collision_only_prop = bpy.props.BoolProperty(
         name="Collision Only", get=lambda s: bool(s.get("godot_collision_only", False)),
         set=lambda s, v: s.__setitem__("godot_collision_only", v))
+    _register_keymaps()  # F = frame selected, like Godot
     for cls in (GODOT_OT_bake, GODOT_OT_resync, GODOT_PT_panel):
         try:
             bpy.utils.register_class(cls)

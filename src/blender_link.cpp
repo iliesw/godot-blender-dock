@@ -137,6 +137,15 @@ bool BlenderLink::take_just_connected() {
 	return v;
 }
 
+bool BlenderLink::take_blender_view(Dictionary &r_view) {
+	if (!has_blender_view) {
+		return false;
+	}
+	has_blender_view = false;
+	r_view = blender_view;
+	return true;
+}
+
 String BlenderLink::take_notice() {
 	String n = notice;
 	notice = "";
@@ -311,6 +320,9 @@ void BlenderLink::_handle_frame(const Dictionary &h, const uint8_t *blob, int64_
 			notice = "Bake failed: " + String(h.get("msg", "unknown error"));
 		}
 		UtilityFunctions::print("Blender Dock: ", notice);
+	} else if (t == "view") {
+		blender_view = h; // only the newest matters
+		has_blender_view = true;
 	} else if (t == "bye") {
 		bye_received = true;
 	} else if (t == "hello") {

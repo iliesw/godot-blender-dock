@@ -56,6 +56,7 @@ public:
 	int get_object_count() const { return objects.size(); }
 	String get_blend_file() const { return blend_file; }
 	String take_notice(); // one-shot user-facing message (bake results...)
+	bool take_blender_view(Dictionary &r_view); // newest Blender viewport, if any arrived
 
 	bool add_to_edited_scene();
 	bool edited_scene_has_link();
@@ -114,6 +115,8 @@ private:
 	bool just_connected = false;
 	bool scene_received = false;
 	bool bye_received = false;
+	Dictionary blender_view;
+	bool has_blender_view = false;
 
 	PackedByteArray inbuf;
 	int64_t inbuf_off = 0;

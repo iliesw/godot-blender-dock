@@ -37,7 +37,7 @@ const char *S_BLENDER_PATH = "blender_dock/blender_path";
 const char *S_PORT = "blender_dock/link_port";
 const char *S_FOLLOW_MOUSE = "blender_dock/hover_gives_focus"; // opt-in: switching focus on hover costs a window activation
 const char *S_AUTO_LAUNCH = "blender_dock/auto_launch";
-const char *S_MATCH_THEME = "blender_dock/match_godot_theme";
+const char *S_MATCH_THEME = "blender_dock/use_godot_colors_in_blender"; // off: Blender keeps its default theme
 const char *S_HIDE_STATUSBAR = "blender_dock/hide_blender_status_bar";
 const char *S_RECOVERY = "blender_dock/recovery_interval_seconds";
 const char *S_KEEP_SPLASH = "blender_dock/show_blender_splash";
@@ -129,7 +129,7 @@ void BlenderDockPlugin::_ensure_settings() {
 	add(S_FOLLOW_MOUSE, false, PROPERTY_HINT_NONE, "");
 	add(S_HITCH_LOG, true, PROPERTY_HINT_NONE, "");
 	add(S_AUTO_LAUNCH, false, PROPERTY_HINT_NONE, "");
-	add(S_MATCH_THEME, true, PROPERTY_HINT_NONE, "");
+	add(S_MATCH_THEME, false, PROPERTY_HINT_NONE, "");
 	add(S_HIDE_STATUSBAR, true, PROPERTY_HINT_NONE, "");
 	add(S_RECOVERY, 30, PROPERTY_HINT_RANGE, "0,600,1,suffix:s");
 	add(S_KEEP_SPLASH, false, PROPERTY_HINT_NONE, "");
@@ -236,7 +236,7 @@ void BlenderDockPlugin::_build_panel(Panel &p) {
 	bar->add_child(memnew(VSeparator));
 	p.add_link = button("Link to Scene", "Node3D", "Add a BlenderLink node to the current 3D scene; Blender objects stream into it live.", "_on_add_link_pressed");
 	p.sync = check("Live Sync", sync_enabled, "Apply Blender changes to the scene in real time.", "_on_sync_toggled");
-	p.follow = check("Follow View", follow_view, "Blender's 3D view follows Godot's 3D editor camera.", "_on_follow_toggled");
+	p.follow = check("Follow View", follow_view, "Both 3D views follow each other: the program you are working in drives the other.", "_on_follow_toggled");
 	p.bake = button("Bake glTF", "PackedScene", "Export Blender's selection (rigs, skinning, shape keys, animations) as .glb into res://blender_assets.", "_on_bake_pressed");
 	p.settings = button("", "Tools", "Blender Dock settings", "_on_settings_pressed");
 
@@ -335,7 +335,7 @@ void BlenderDockPlugin::_build_settings() {
 	};
 	flag("Startup", "Launch Blender when the editor opens", s.auto_launch);
 	flag("Keyboard focus", "Hovering gives focus (default: click, like normal windows)", s.follow_mouse);
-	flag("Look", "Match Blender's colors to the Godot theme", s.theme);
+	flag("Look", "Use Godot's colors in Blender (off = Blender's default theme)", s.theme);
 	flag("", "Hide Blender's status bar while docked", s.statusbar);
 	flag("", "Show Blender's splash screen", s.splash);
 
@@ -816,6 +816,10 @@ void BlenderDockPlugin::_process_inner(double p_delta) {
 	if (link.is_valid()) {
 		link->poll(sync_enabled);
 		if (link->take_just_connected()) {
+			Dictionary f;
+			f["t"] = "follow";
+			f["on"] = follow_view;
+			link->send(f);
 			embedded_sent_parent = 0;
 			chrome_sent_docked = !chrome_sent_docked; // force resend
 			last_view = Transform3D();
@@ -885,6 +889,7 @@ void BlenderDockPlugin::_process_inner(double p_delta) {
 
 	if (follow_view) {
 		_follow_view();
+		_apply_blender_view();
 	}
 
 	if (!tab_icon_fixed && blender_icon.is_valid()) {
@@ -1002,7 +1007,13 @@ void BlenderDockPlugin::_send_chrome() {
 }
 
 void BlenderDockPlugin::_follow_view() {
-	if (!link.is_valid() || !link->is_peer_connected()) {
+	// Two-way follow: whichever program is active drives the view. Godot -> Blender here
+	// (at most 30 updates/s, Blender applies only the newest); Blender -> Godot in _on_blender_view.
+	if (!link.is_valid() || !link->is_peer_connected() || !this_process_is_foreground()) {
+		return;
+	}
+	uint64_t now = Time::get_singleton()->get_ticks_msec();
+	if (now < next_view_send_ms) {
 		return;
 	}
 	SubViewport *vp = EditorInterface::get_singleton()->get_editor_viewport_3d(0);
@@ -1018,6 +1029,7 @@ void BlenderDockPlugin::_follow_view() {
 	if (t.is_equal_approx(last_view) && Math::is_equal_approx(fov, last_fov)) {
 		return;
 	}
+	next_view_send_ms = now + 33;
 	last_view = t;
 	last_fov = fov;
 	Dictionary d;
@@ -1028,6 +1040,28 @@ void BlenderDockPlugin::_follow_view() {
 	d["size"] = cam->get_size();
 	d["distance"] = 10.0;
 	link->send(d);
+}
+
+void BlenderDockPlugin::_apply_blender_view() {
+	// Blender -> Godot: only while Blender is the active window (it is the one being navigated).
+	Dictionary v;
+	if (!link.is_valid() || !link->take_blender_view(v) || !follow_view || this_process_is_foreground()) {
+		return;
+	}
+	SubViewport *vp = EditorInterface::get_singleton()->get_editor_viewport_3d(0);
+	Camera3D *cam = vp ? vp->get_camera_3d() : nullptr;
+	Array x = v.get("xform", Array());
+	if (!cam || x.size() != 12) {
+		return;
+	}
+	Transform3D t(Basis(Vector3(x[0], x[1], x[2]), Vector3(x[3], x[4], x[5]), Vector3(x[6], x[7], x[8])),
+			Vector3(x[9], x[10], x[11]));
+	last_view = t; // so Godot does not echo it back
+	if (Node3D *lr = link->get_link_root()) {
+		t = lr->get_global_transform() * t;
+	}
+	// Godot keeps this until its own camera is navigated again (it has no public API to move its orbit pivot).
+	cam->set_global_transform(t);
 }
 
 void BlenderDockPlugin::_save_external_data() {
@@ -1077,7 +1111,7 @@ void BlenderDockPlugin::_launch(const String &p_blend) {
 		args += " --godot-recovery-interval " + itos(recovery);
 	}
 	args += String(" --godot-hide-statusbar ") + (bool(_setting(S_HIDE_STATUSBAR, true)) ? "1" : "0");
-	if (bool(_setting(S_MATCH_THEME, true))) {
+	if (bool(_setting(S_MATCH_THEME, false))) {
 		Ref<EditorSettings> es = EditorInterface::get_singleton()->get_editor_settings();
 		if (es->has_setting("interface/theme/base_color")) {
 			args += " --godot-base " + Color(es->get_setting("interface/theme/base_color")).to_html(false);
@@ -1210,6 +1244,12 @@ void BlenderDockPlugin::_on_sync_toggled(bool p_on) {
 void BlenderDockPlugin::_on_follow_toggled(bool p_on) {
 	follow_view = p_on;
 	last_view = Transform3D();
+	if (link.is_valid()) {
+		Dictionary d;
+		d["t"] = "follow";
+		d["on"] = p_on;
+		link->send(d);
+	}
 	_update_ui();
 }
 
@@ -1226,7 +1266,7 @@ void BlenderDockPlugin::_on_settings_pressed() {
 	s.recovery->set_value(int(_setting(S_RECOVERY, 30)));
 	s.auto_launch->set_pressed(_setting(S_AUTO_LAUNCH, false));
 	s.follow_mouse->set_pressed(_setting(S_FOLLOW_MOUSE, false));
-	s.theme->set_pressed(_setting(S_MATCH_THEME, true));
+	s.theme->set_pressed(_setting(S_MATCH_THEME, false));
 	s.statusbar->set_pressed(_setting(S_HIDE_STATUSBAR, true));
 	s.splash->set_pressed(_setting(S_KEEP_SPLASH, false));
 	s.dialog->popup_centered();
