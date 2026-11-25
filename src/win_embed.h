@@ -31,6 +31,10 @@ public:
 	bool find_window();
 	bool has_window();
 	bool is_embedded() const { return embedded_; }
+	intptr_t hwnd() const { return hwnd_; }
+	intptr_t parent() const { return parent_; }
+	// True while Blender's UI thread is not answering (long operation / freeze).
+	bool is_blender_busy() const { return busy_; }
 
 	void embed(intptr_t parent_hwnd);
 	void detach();
@@ -64,4 +68,7 @@ private:
 	EmbedRect last_rect_;
 	uint64_t godot_hover_since_ = 0;
 	bool prev_buttons_ = false;
+	bool busy_ = false;
+	uint64_t next_busy_check_ = 0;
+	bool check_responsive(unsigned timeout_ms);
 };

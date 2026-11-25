@@ -316,8 +316,18 @@ bool WinEmbed::blender_has_focus() {
 	return f && (f == H(hwnd_) || IsChild(H(hwnd_), f));
 }
 
+bool WinEmbed::check_responsive(unsigned timeout_ms) {
+	DWORD_PTR res = 0;
+	return SendMessageTimeoutW(H(hwnd_), WM_NULL, 0, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK, timeout_ms, &res) != 0;
+}
+
 void WinEmbed::focus_blender() {
 	if (!embedded_ || !visible_ || !has_window()) {
+		return;
+	}
+	// Never share input with a frozen Blender: Godot's own input would freeze with it.
+	if (busy_ || IsHungAppWindow(H(hwnd_)) || !check_responsive(30)) {
+		busy_ = true;
 		return;
 	}
 	// Share the input queue only while Blender owns the keyboard, so a busy Blender
@@ -360,6 +370,25 @@ void WinEmbed::update_focus(bool follow_mouse, bool godot_text_focused) {
 	if (GetForegroundWindow() != top) {
 		return; // another app (or a Godot dialog / Blender preferences window) is in front
 	}
+	// Hang guard: while input is shared, a frozen Blender would freeze Godot's input too.
+	uint64_t tick = GetTickCount64();
+	if (tick >= next_busy_check_) {
+		next_busy_check_ = tick + (input_attached_ || busy_ ? 250 : 1000);
+		bool responsive = !IsHungAppWindow(H(hwnd_)) && check_responsive(input_attached_ ? 60 : 15);
+		if (!responsive) {
+			if (!busy_ && input_attached_) {
+				attach_input(false); // detach first, then Godot can take its keyboard back
+				SetFocus(H(parent_));
+			}
+			busy_ = true;
+			return;
+		}
+		busy_ = false;
+	}
+	if (busy_) {
+		return;
+	}
+
 	bool buttons = any_button_down();
 	bool pressed = buttons && !prev_buttons_;
 	prev_buttons_ = buttons;

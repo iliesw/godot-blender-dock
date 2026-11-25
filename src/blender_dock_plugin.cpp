@@ -2,25 +2,31 @@
 
 #include "win_embed.h"
 
+#include <godot_cpp/classes/camera3d.hpp>
 #include <godot_cpp/classes/dir_access.hpp>
 #include <godot_cpp/classes/display_server.hpp>
 #include <godot_cpp/classes/editor_interface.hpp>
+#include <godot_cpp/classes/editor_selection.hpp>
 #include <godot_cpp/classes/editor_settings.hpp>
 #include <godot_cpp/classes/file_access.hpp>
+#include <godot_cpp/classes/grid_container.hpp>
 #include <godot_cpp/classes/h_box_container.hpp>
+#include <godot_cpp/classes/h_flow_container.hpp>
 #include <godot_cpp/classes/image.hpp>
 #include <godot_cpp/classes/image_texture.hpp>
-#include <godot_cpp/classes/line_edit.hpp>
 #include <godot_cpp/classes/os.hpp>
 #include <godot_cpp/classes/project_settings.hpp>
+#include <godot_cpp/classes/sub_viewport.hpp>
 #include <godot_cpp/classes/text_edit.hpp>
 #include <godot_cpp/classes/theme.hpp>
+#include <godot_cpp/classes/time.hpp>
 #include <godot_cpp/classes/v_separator.hpp>
 #include <godot_cpp/classes/viewport.hpp>
 #include <godot_cpp/classes/window.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 
 #include <cmath>
+#include <cstring>
 
 using namespace godot;
 
@@ -29,6 +35,11 @@ namespace {
 const char *S_BLENDER_PATH = "blender_dock/blender_path";
 const char *S_PORT = "blender_dock/link_port";
 const char *S_FOLLOW_MOUSE = "blender_dock/focus_follows_mouse";
+const char *S_AUTO_LAUNCH = "blender_dock/auto_launch";
+const char *S_MATCH_THEME = "blender_dock/match_godot_theme";
+const char *S_HIDE_STATUSBAR = "blender_dock/hide_blender_status_bar";
+const char *S_RECOVERY = "blender_dock/recovery_interval_seconds";
+const char *S_KEEP_SPLASH = "blender_dock/show_blender_splash";
 const char *P_BLEND_FILE = "blender_dock/blend_file";
 const char *SCRIPT_PATH = "res://addons/blender_dock/blender/godot_link.py";
 
@@ -45,6 +56,31 @@ String quote(const String &s) {
 	return "\"" + s + "\"";
 }
 
+PackedFloat32Array xform_list(const Transform3D &t) {
+	PackedFloat32Array a;
+	a.resize(12);
+	float *w = a.ptrw();
+	for (int c = 0; c < 3; c++) {
+		Vector3 col = t.basis.get_column(c);
+		w[c * 3 + 0] = col.x;
+		w[c * 3 + 1] = col.y;
+		w[c * 3 + 2] = col.z;
+	}
+	w[9] = t.origin.x;
+	w[10] = t.origin.y;
+	w[11] = t.origin.z;
+	return a;
+}
+
+void ensure_ignored_dir(const String &p_res_dir) {
+	String abs = ProjectSettings::get_singleton()->globalize_path(p_res_dir);
+	DirAccess::make_dir_recursive_absolute(abs);
+	String ignore = abs.path_join(".gdignore");
+	if (!FileAccess::file_exists(ignore)) {
+		Ref<FileAccess> f = FileAccess::open(ignore, FileAccess::WRITE);
+	}
+}
+
 } // namespace
 
 BlenderDockPlugin::BlenderDockPlugin() :
@@ -57,8 +93,17 @@ void BlenderDockPlugin::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("_on_open_pressed"), &BlenderDockPlugin::_on_open_pressed);
 	ClassDB::bind_method(D_METHOD("_on_popout_pressed"), &BlenderDockPlugin::_on_popout_pressed);
 	ClassDB::bind_method(D_METHOD("_on_add_link_pressed"), &BlenderDockPlugin::_on_add_link_pressed);
+	ClassDB::bind_method(D_METHOD("_on_bake_pressed"), &BlenderDockPlugin::_on_bake_pressed);
+	ClassDB::bind_method(D_METHOD("_on_settings_pressed"), &BlenderDockPlugin::_on_settings_pressed);
+	ClassDB::bind_method(D_METHOD("_on_settings_confirmed"), &BlenderDockPlugin::_on_settings_confirmed);
+	ClassDB::bind_method(D_METHOD("_on_browse_blender"), &BlenderDockPlugin::_on_browse_blender);
+	ClassDB::bind_method(D_METHOD("_on_blender_path_selected", "path"), &BlenderDockPlugin::_on_blender_path_selected);
 	ClassDB::bind_method(D_METHOD("_on_sync_toggled", "on"), &BlenderDockPlugin::_on_sync_toggled);
+	ClassDB::bind_method(D_METHOD("_on_follow_toggled", "on"), &BlenderDockPlugin::_on_follow_toggled);
 	ClassDB::bind_method(D_METHOD("_on_file_selected", "path"), &BlenderDockPlugin::_on_file_selected);
+	ClassDB::bind_method(D_METHOD("_on_selection_changed"), &BlenderDockPlugin::_on_selection_changed);
+	ClassDB::bind_method(D_METHOD("_on_recover_confirmed"), &BlenderDockPlugin::_on_recover_confirmed);
+	ClassDB::bind_method(D_METHOD("_on_recover_canceled"), &BlenderDockPlugin::_on_recover_canceled);
 }
 
 // ---------------------------------------------------------------------------- settings
@@ -80,6 +125,11 @@ void BlenderDockPlugin::_ensure_settings() {
 	add(S_BLENDER_PATH, String(), PROPERTY_HINT_GLOBAL_FILE, "*.exe");
 	add(S_PORT, 6789, PROPERTY_HINT_RANGE, "1024,65535,1");
 	add(S_FOLLOW_MOUSE, true, PROPERTY_HINT_NONE, "");
+	add(S_AUTO_LAUNCH, false, PROPERTY_HINT_NONE, "");
+	add(S_MATCH_THEME, true, PROPERTY_HINT_NONE, "");
+	add(S_HIDE_STATUSBAR, true, PROPERTY_HINT_NONE, "");
+	add(S_RECOVERY, 30, PROPERTY_HINT_RANGE, "0,600,1,suffix:s");
+	add(S_KEEP_SPLASH, false, PROPERTY_HINT_NONE, "");
 
 	ProjectSettings *ps = ProjectSettings::get_singleton();
 	if (!ps->has_setting(P_BLEND_FILE)) {
@@ -95,6 +145,13 @@ void BlenderDockPlugin::_ensure_settings() {
 }
 
 Variant BlenderDockPlugin::_setting(const String &p_name, const Variant &p_default) const {
+	// Test hook: run a second editor without fighting over the port.
+	if (p_name == S_PORT) {
+		String env_port = OS::get_singleton()->get_environment("BLENDER_DOCK_PORT");
+		if (env_port.is_valid_int()) {
+			return env_port.to_int();
+		}
+	}
 	Ref<EditorSettings> es = EditorInterface::get_singleton()->get_editor_settings();
 	return es.is_valid() && es->has_setting(p_name) ? es->get_setting(p_name) : p_default;
 }
@@ -104,7 +161,6 @@ String BlenderDockPlugin::_find_blender() const {
 	if (!configured.is_empty() && FileAccess::file_exists(configured)) {
 		return configured;
 	}
-	// Newest "Blender X.Y" under Program Files.
 	const String base = "C:/Program Files/Blender Foundation";
 	PackedStringArray dirs = DirAccess::get_directories_at(base);
 	String best;
@@ -120,6 +176,24 @@ String BlenderDockPlugin::_find_blender() const {
 	return best;
 }
 
+String BlenderDockPlugin::_recovery_path() const {
+	return OS::get_singleton()->get_user_data_dir().path_join("blender_dock_recovery.blend");
+}
+
+String BlenderDockPlugin::_default_blend_path() const {
+	String blend = ProjectSettings::get_singleton()->get_setting(P_BLEND_FILE, String());
+	if (!blend.is_empty()) {
+		return ProjectSettings::get_singleton()->globalize_path(blend);
+	}
+	String scene = "main";
+	if (Node *root = EditorInterface::get_singleton()->get_edited_scene_root()) {
+		if (!root->get_scene_file_path().is_empty()) {
+			scene = root->get_scene_file_path().get_file().get_basename();
+		}
+	}
+	return ProjectSettings::get_singleton()->globalize_path("res://blender").path_join(scene + ".blend");
+}
+
 // ---------------------------------------------------------------------------- UI
 
 void BlenderDockPlugin::_build_panel(Panel &p) {
@@ -128,34 +202,47 @@ void BlenderDockPlugin::_build_panel(Panel &p) {
 	p.root->set_v_size_flags(Control::SIZE_EXPAND_FILL);
 	p.root->set_h_size_flags(Control::SIZE_EXPAND_FILL);
 
-	HBoxContainer *bar = memnew(HBoxContainer);
+	HFlowContainer *bar = memnew(HFlowContainer); // wraps when the dock is narrow
 	p.root->add_child(bar);
+	Ref<Theme> theme = EditorInterface::get_singleton()->get_editor_theme();
 
-	auto button = [&](const String &text, const String &tip, const char *method) {
+	auto button = [&](const String &text, const String &icon, const String &tip, const char *method) {
 		Button *b = memnew(Button);
 		b->set_text(text);
+		if (!icon.is_empty() && theme.is_valid() && theme->has_icon(icon, "EditorIcons")) {
+			b->set_button_icon(theme->get_icon(icon, "EditorIcons"));
+		}
 		b->set_tooltip_text(tip);
 		b->set_flat(true);
 		b->connect("pressed", Callable(this, method));
 		bar->add_child(b);
 		return b;
 	};
-	p.launch = button("Launch Blender", "Start Blender inside the editor (opens the project's .blend if set).", "_on_launch_pressed");
-	p.open = button("Open .blend...", "Open a .blend file in the embedded Blender.", "_on_open_pressed");
-	p.popout = button("Pop Out", "Move Blender to its own window / dock it back.", "_on_popout_pressed");
+	auto check = [&](const String &text, bool on, const String &tip, const char *method) {
+		CheckBox *c = memnew(CheckBox);
+		c->set_text(text);
+		c->set_pressed(on);
+		c->set_tooltip_text(tip);
+		c->connect("toggled", Callable(this, method));
+		bar->add_child(c);
+		return c;
+	};
+	p.launch = button("Launch", "Play", "Start Blender inside the editor (opens the project's .blend if set).", "_on_launch_pressed");
+	p.open = button("Open .blend", "Load", "Open a .blend file in the embedded Blender.", "_on_open_pressed");
+	p.popout = button("Pop Out", "MakeFloating", "Move Blender to its own window / dock it back.", "_on_popout_pressed");
 	bar->add_child(memnew(VSeparator));
-	p.add_link = button("Link to Scene", "Add a BlenderLink node to the current 3D scene; Blender objects stream into it live.", "_on_add_link_pressed");
-	p.sync = memnew(CheckBox);
-	p.sync->set_text("Live Sync");
-	p.sync->set_pressed(sync_enabled);
-	p.sync->set_tooltip_text("Apply Blender changes to the scene in real time.");
-	p.sync->connect("toggled", Callable(this, "_on_sync_toggled"));
-	bar->add_child(p.sync);
+	p.add_link = button("Link to Scene", "Node3D", "Add a BlenderLink node to the current 3D scene; Blender objects stream into it live.", "_on_add_link_pressed");
+	p.sync = check("Live Sync", sync_enabled, "Apply Blender changes to the scene in real time.", "_on_sync_toggled");
+	p.follow = check("Follow View", follow_view, "Blender's 3D view follows Godot's 3D editor camera.", "_on_follow_toggled");
+	p.bake = button("Bake glTF", "PackedScene", "Export Blender's selection (rigs, skinning, shape keys, animations) as .glb into res://blender_assets.", "_on_bake_pressed");
+	p.settings = button("", "Tools", "Blender Dock settings", "_on_settings_pressed");
 
 	p.status = memnew(Label);
 	p.status->set_h_size_flags(Control::SIZE_EXPAND_FILL);
 	p.status->set_horizontal_alignment(HORIZONTAL_ALIGNMENT_RIGHT);
+	p.status->set_vertical_alignment(VERTICAL_ALIGNMENT_CENTER);
 	p.status->set_text_overrun_behavior(TextServer::OVERRUN_TRIM_ELLIPSIS);
+	p.status->set_custom_minimum_size(Vector2(120, 0));
 	p.status->set_modulate(Color(1, 1, 1, 0.65));
 	bar->add_child(p.status);
 
@@ -174,6 +261,72 @@ void BlenderDockPlugin::_build_panel(Panel &p) {
 	p.placeholder->set_autowrap_mode(TextServer::AUTOWRAP_WORD_SMART);
 	p.placeholder->set_modulate(Color(1, 1, 1, 0.5));
 	p.host->add_child(p.placeholder);
+}
+
+void BlenderDockPlugin::_build_settings() {
+	SettingsUI &s = settings;
+	s.dialog = memnew(AcceptDialog);
+	s.dialog->set_title("Blender Dock Settings");
+	s.dialog->set_ok_button_text("Save");
+	s.dialog->add_cancel_button("Cancel");
+	s.dialog->connect("confirmed", Callable(this, "_on_settings_confirmed"));
+
+	GridContainer *grid = memnew(GridContainer);
+	grid->set_columns(2);
+	grid->set_custom_minimum_size(Vector2(560, 0));
+	s.dialog->add_child(grid);
+
+	auto label = [&](const String &t) {
+		Label *l = memnew(Label);
+		l->set_text(t);
+		grid->add_child(l);
+	};
+	label("Blender executable");
+	HBoxContainer *row = memnew(HBoxContainer);
+	row->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+	s.path = memnew(LineEdit);
+	s.path->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+	s.path->set_placeholder("Auto-detect newest Blender in Program Files");
+	row->add_child(s.path);
+	Button *browse = memnew(Button);
+	browse->set_text("Browse...");
+	browse->connect("pressed", Callable(this, "_on_browse_blender"));
+	row->add_child(browse);
+	grid->add_child(row);
+
+	label("Link port");
+	s.port = memnew(SpinBox);
+	s.port->set_min(1024);
+	s.port->set_max(65535);
+	grid->add_child(s.port);
+
+	label("Recovery copy every");
+	s.recovery = memnew(SpinBox);
+	s.recovery->set_min(0);
+	s.recovery->set_max(600);
+	s.recovery->set_suffix("s (0 = off)");
+	grid->add_child(s.recovery);
+
+	auto flag = [&](const String &title, const String &text, CheckBox *&r_box) {
+		label(title);
+		r_box = memnew(CheckBox);
+		r_box->set_text(text);
+		grid->add_child(r_box);
+	};
+	flag("Startup", "Launch Blender when the editor opens", s.auto_launch);
+	flag("Keyboard focus", "Follows the mouse (otherwise: click to focus)", s.follow_mouse);
+	flag("Look", "Match Blender's colors to the Godot theme", s.theme);
+	flag("", "Hide Blender's status bar while docked", s.statusbar);
+	flag("", "Show Blender's splash screen", s.splash);
+
+	s.browse = memnew(EditorFileDialog);
+	s.browse->set_file_mode(EditorFileDialog::FILE_MODE_OPEN_FILE);
+	s.browse->set_access(EditorFileDialog::ACCESS_FILESYSTEM);
+	s.browse->add_filter("blender.exe", "Blender");
+	s.browse->connect("file_selected", Callable(this, "_on_blender_path_selected"));
+	s.dialog->add_child(s.browse);
+
+	EditorInterface::get_singleton()->get_base_control()->add_child(s.dialog);
 }
 
 void BlenderDockPlugin::_enter_tree() {
@@ -204,24 +357,49 @@ void BlenderDockPlugin::_enter_tree() {
 	file_dialog->connect("file_selected", Callable(this, "_on_file_selected"));
 	EditorInterface::get_singleton()->get_base_control()->add_child(file_dialog);
 
+	recover_dialog = memnew(ConfirmationDialog);
+	recover_dialog->set_title("Recover Blender work?");
+	recover_dialog->set_text("Blender did not close cleanly last time (the editor may have crashed).\n"
+							 "A recovery copy of your unsaved Blender work exists.\n\nOpen the recovered copy?");
+	recover_dialog->set_ok_button_text("Open Recovered Copy");
+	recover_dialog->set_cancel_button_text("Discard It");
+	recover_dialog->connect("confirmed", Callable(this, "_on_recover_confirmed"));
+	recover_dialog->connect("canceled", Callable(this, "_on_recover_canceled"));
+	EditorInterface::get_singleton()->get_base_control()->add_child(recover_dialog);
+
+	_build_settings();
+
+	EditorInterface::get_singleton()->get_selection()->connect("selection_changed", Callable(this, "_on_selection_changed"));
+
 	link.instantiate();
 	link->start(int(_setting(S_PORT, 6789)));
 
 	set_process(true);
 	_update_ui();
 
-	// Test / power-user hook: BLENDER_DOCK_AUTOLAUNCH=1 starts Blender with the editor.
-	if (OS::get_singleton()->get_environment("BLENDER_DOCK_AUTOLAUNCH") == "1") {
+	bool env_auto = OS::get_singleton()->get_environment("BLENDER_DOCK_AUTOLAUNCH") == "1";
+	if (env_auto || bool(_setting(S_AUTO_LAUNCH, false))) {
 		callable_mp(this, &BlenderDockPlugin::_on_launch_pressed).call_deferred();
-		pending_auto_link = true;
+		pending_auto_link = env_auto;
+	}
+	if (OS::get_singleton()->get_environment("BLENDER_DOCK_SELFTEST") == "1") {
+		selftest_step = 0;
 	}
 }
 
 void BlenderDockPlugin::_exit_tree() {
 	set_process(false);
+	EditorSelection *sel = EditorInterface::get_singleton()->get_selection();
+	if (sel && sel->is_connected("selection_changed", Callable(this, "_on_selection_changed"))) {
+		sel->disconnect("selection_changed", Callable(this, "_on_selection_changed"));
+	}
 	// Leave Blender running as a normal window: never risk unsaved work.
 	embed->detach();
 	if (link.is_valid()) {
+		Dictionary d;
+		d["t"] = "chrome";
+		d["docked"] = false;
+		link->send(d);
 		link->stop();
 		link.unref();
 	}
@@ -232,13 +410,17 @@ void BlenderDockPlugin::_exit_tree() {
 	}
 	if (main_panel.root) {
 		main_panel.root->queue_free();
-		main_panel = Panel();
 	}
+	main_panel = Panel();
 	dock_panel = Panel();
-	if (file_dialog) {
-		file_dialog->queue_free();
-		file_dialog = nullptr;
+	for (Node *n : { (Node *)file_dialog, (Node *)recover_dialog, (Node *)settings.dialog }) {
+		if (n) {
+			n->queue_free();
+		}
 	}
+	file_dialog = nullptr;
+	recover_dialog = nullptr;
+	settings = SettingsUI();
 }
 
 void BlenderDockPlugin::_make_visible(bool p_visible) {
@@ -277,7 +459,7 @@ bool BlenderDockPlugin::_untint_tab_icon(Node *p_node) {
 		return false;
 	}
 	Button *b = Object::cast_to<Button>(p_node);
-	if (b && b->get_button_icon() == blender_icon && b != (dock_panel.launch)) {
+	if (b && b->get_button_icon() == blender_icon) {
 		for (const char *c : { "icon_normal_color", "icon_hover_color", "icon_pressed_color", "icon_hover_pressed_color",
 					 "icon_focus_color" }) {
 			b->add_theme_color_override(c, Color(1, 1, 1));
@@ -306,19 +488,25 @@ Control *BlenderDockPlugin::_active_host() {
 void BlenderDockPlugin::_update_ui() {
 	bool running = embed->is_running();
 	bool window = running && embed->has_window();
+	bool connected = link.is_valid() && link->is_peer_connected();
 
 	String blender = !running ? String("Blender: stopped")
-							  : (window ? String("Blender: running") : String("Blender: starting..."));
+							  : (!window ? String("Blender: starting...")
+										 : (embed->is_blender_busy() ? String("Blender: busy") : String("Blender: running")));
 	String linkst;
 	if (!link.is_valid() || !link->is_listening()) {
 		linkst = "Link: off (port busy?)";
-	} else if (link->is_peer_connected()) {
-		linkst = vformat("Link: live | %d objects", link->get_object_count());
+	} else if (connected) {
+		linkst = vformat("Link: live, %d objects", link->get_object_count());
 	} else {
 		linkst = vformat("Link: waiting on :%d", link->get_port());
 	}
 	String scene = link.is_valid() && link->edited_scene_has_link() ? String(" | scene linked") : String();
 	String status = blender + " | " + linkst + scene;
+	double now = Time::get_singleton()->get_ticks_msec() / 1000.0;
+	if (!notice.is_empty() && now - notice_time < 6.0) {
+		status = notice;
+	}
 	if (!last_error.is_empty()) {
 		status = last_error;
 	}
@@ -334,11 +522,14 @@ void BlenderDockPlugin::_update_ui() {
 		p->popout->set_disabled(!window);
 		p->popout->set_text(popped_out ? "Dock" : "Pop Out");
 		p->add_link->set_disabled(!link.is_valid() || link->edited_scene_has_link());
+		p->bake->set_disabled(!connected);
 		p->sync->set_pressed_no_signal(sync_enabled);
+		p->follow->set_pressed_no_signal(follow_view);
+		p->follow->set_disabled(!connected);
 
 		String ph;
 		if (!running) {
-			ph = "Blender is not running.\nPress \"Launch Blender\".";
+			ph = "Blender is not running.\nPress \"Launch\".";
 		} else if (!window) {
 			ph = "Starting Blender...";
 		} else if (popped_out) {
@@ -356,6 +547,17 @@ void BlenderDockPlugin::_update_ui() {
 void BlenderDockPlugin::_process(double p_delta) {
 	if (link.is_valid()) {
 		link->poll(sync_enabled);
+		if (link->take_just_connected()) {
+			embedded_sent_parent = 0;
+			chrome_sent_docked = !chrome_sent_docked; // force resend
+			last_view = Transform3D();
+		}
+		String n = link->take_notice();
+		if (!n.is_empty()) {
+			notice = n;
+			notice_time = Time::get_singleton()->get_ticks_msec() / 1000.0;
+		}
+		link->watch_selected_transforms();
 	}
 
 	if (embed->is_running()) {
@@ -388,15 +590,34 @@ void BlenderDockPlugin::_process(double p_delta) {
 				embed->set_visible(false);
 			}
 		}
+		// Tell Blender where it lives, so it can rescue its window if the editor dies.
+		if (link.is_valid() && link->is_peer_connected() && embed->is_embedded() &&
+				embed->parent() != embedded_sent_parent) {
+			embedded_sent_parent = embed->parent();
+			Dictionary d;
+			d["t"] = "embedded";
+			d["hwnd"] = int64_t(embed->hwnd());
+			d["parent"] = int64_t(embed->parent());
+			link->send(d);
+		}
+		_send_chrome();
+	}
+
+	if (follow_view) {
+		_follow_view();
 	}
 
 	if (!tab_icon_fixed && blender_icon.is_valid()) {
 		tab_icon_fixed = _untint_tab_icon(EditorInterface::get_singleton()->get_base_control()->get_parent());
 	}
 
-	if (pending_auto_link &&Object::cast_to<Node3D>(EditorInterface::get_singleton()->get_edited_scene_root())) {
+	if (pending_auto_link && Object::cast_to<Node3D>(EditorInterface::get_singleton()->get_edited_scene_root())) {
 		pending_auto_link = false;
 		link->add_to_edited_scene();
+	}
+
+	if (selftest_step >= 0) {
+		_self_test(p_delta);
 	}
 
 	ui_cooldown -= p_delta;
@@ -406,22 +627,185 @@ void BlenderDockPlugin::_process(double p_delta) {
 	}
 }
 
+void BlenderDockPlugin::_self_test(double p_delta) {
+	selftest_time += p_delta;
+	auto log = [](const String &s) { UtilityFunctions::print("SELFTEST ", s); };
+	EditorInterface *ei = EditorInterface::get_singleton();
+	switch (selftest_step) {
+		case 0: // wait for Blender + link + linked scene with a Cube
+			if (link->is_peer_connected() && link->edited_scene_has_link() && link->get_object_count() >= 3 &&
+					embed->has_window() && selftest_time > 3.0) {
+				log("start");
+				ei->set_main_screen_editor("3D");
+				selftest_step = 1;
+				selftest_time = 0;
+			}
+			break;
+		case 1:
+			if (selftest_time > 1.0) {
+				log(vformat("before dock open: main_visible=%s", main_visible));
+				dock->make_visible();
+				selftest_step = 2;
+				selftest_time = 0;
+			}
+			break;
+		case 2:
+			if (selftest_time > 1.0) {
+				log(vformat("item2 dock open keeps 3D screen: %s (main_visible=%s, dock host active=%s)",
+						!main_visible ? "PASS" : "FAIL", main_visible, _active_host() == dock_panel.host));
+				Node3D *lr = link->get_link_root();
+				Node3D *cube = nullptr;
+				for (int i = 0; lr && i < lr->get_child_count() && !cube; i++) {
+					cube = Object::cast_to<Node3D>(lr->find_child("Cube", true, false));
+				}
+				if (cube) {
+					ei->get_selection()->clear();
+					ei->get_selection()->add_node(cube);
+				}
+				log(vformat("selected Cube in Godot: %s", cube != nullptr));
+				selftest_step = 3;
+				selftest_time = 0;
+			}
+			break;
+		case 3:
+			if (selftest_time > 1.0) {
+				TypedArray<Node> sel = ei->get_selection()->get_selected_nodes();
+				Node3D *cube = sel.size() ? Object::cast_to<Node3D>(sel[0]) : nullptr;
+				if (cube) {
+					cube->set_position(cube->get_position() + Vector3(1.5, 0, 0));
+					log(vformat("moved Cube in Godot to %s", cube->get_position()));
+				}
+				follow_view = true;
+				selftest_step = 4;
+				selftest_time = 0;
+			}
+			break;
+		case 4:
+			if (selftest_time > 1.5) {
+				_save_external_data();
+				log("requested save of .blend to " + _default_blend_path());
+				selftest_step = 5;
+				selftest_time = 0;
+			}
+			break;
+		case 5:
+			if (selftest_time > 2.0) {
+				_on_bake_pressed();
+				log("requested glTF bake");
+				selftest_step = 6;
+				selftest_time = 0;
+			}
+			break;
+		case 6:
+			if (selftest_time > 4.0) {
+				log("done");
+				selftest_step = -1;
+			}
+			break;
+	}
+}
+
+void BlenderDockPlugin::_send_chrome() {
+	if (!link.is_valid() || !link->is_peer_connected()) {
+		return;
+	}
+	bool docked = embed->is_embedded() && !popped_out;
+	if (docked == chrome_sent_docked) {
+		return;
+	}
+	chrome_sent_docked = docked;
+	Dictionary d;
+	d["t"] = "chrome";
+	d["docked"] = docked;
+	link->send(d);
+}
+
+void BlenderDockPlugin::_follow_view() {
+	if (!link.is_valid() || !link->is_peer_connected()) {
+		return;
+	}
+	SubViewport *vp = EditorInterface::get_singleton()->get_editor_viewport_3d(0);
+	Camera3D *cam = vp ? vp->get_camera_3d() : nullptr;
+	if (!cam) {
+		return;
+	}
+	Transform3D t = cam->get_global_transform();
+	if (Node3D *lr = link->get_link_root()) {
+		t = lr->get_global_transform().affine_inverse() * t;
+	}
+	double fov = cam->get_projection() == Camera3D::PROJECTION_ORTHOGONAL ? cam->get_size() : cam->get_fov();
+	if (t.is_equal_approx(last_view) && Math::is_equal_approx(fov, last_fov)) {
+		return;
+	}
+	last_view = t;
+	last_fov = fov;
+	Dictionary d;
+	d["t"] = "view";
+	d["xform"] = xform_list(t);
+	d["fov"] = cam->get_fov();
+	d["ortho"] = cam->get_projection() == Camera3D::PROJECTION_ORTHOGONAL;
+	d["size"] = cam->get_size();
+	d["distance"] = 10.0;
+	link->send(d);
+}
+
+void BlenderDockPlugin::_save_external_data() {
+	// Ctrl+S in Godot also saves the .blend.
+	if (!link.is_valid() || !link->is_peer_connected()) {
+		return;
+	}
+	String path = _default_blend_path();
+	if (link->get_blend_file().is_empty()) {
+		ensure_ignored_dir(ProjectSettings::get_singleton()->localize_path(path.get_base_dir()));
+		ProjectSettings *ps = ProjectSettings::get_singleton();
+		if (String(ps->get_setting(P_BLEND_FILE, String())).is_empty()) {
+			ps->set_setting(P_BLEND_FILE, ps->localize_path(path));
+			ps->save();
+		}
+	}
+	Dictionary d;
+	d["t"] = "save";
+	d["path"] = path;
+	link->send(d);
+}
+
 // ---------------------------------------------------------------------------- actions
 
 void BlenderDockPlugin::_launch(const String &p_blend) {
 	last_error = "";
 	String exe = _find_blender();
 	if (exe.is_empty()) {
-		last_error = "Blender not found. Set Editor Settings > Blender Dock > Blender Path.";
+		last_error = "Blender not found. Set it in the Blender Dock settings (gear button).";
 		_update_ui();
 		return;
 	}
-	String script = ProjectSettings::get_singleton()->globalize_path(SCRIPT_PATH);
+	ProjectSettings *ps = ProjectSettings::get_singleton();
 	String args;
 	if (!p_blend.is_empty()) {
 		args += quote(p_blend) + " ";
 	}
-	args += "--no-window-focus --python " + quote(script) + " -- --godot-port " + itos(int(_setting(S_PORT, 6789)));
+	args += "--no-window-focus --python " + quote(ps->globalize_path(SCRIPT_PATH)) + " --";
+	args += " --godot-port " + itos(int(_setting(S_PORT, 6789)));
+	args += " --godot-pid " + itos(OS::get_singleton()->get_process_id());
+	args += " --godot-project " + quote(ps->globalize_path("res://").trim_suffix("/"));
+	int recovery = int(_setting(S_RECOVERY, 30));
+	if (recovery > 0) {
+		args += " --godot-recovery " + quote(_recovery_path());
+		args += " --godot-recovery-interval " + itos(recovery);
+	}
+	args += String(" --godot-hide-statusbar ") + (bool(_setting(S_HIDE_STATUSBAR, true)) ? "1" : "0");
+	if (bool(_setting(S_MATCH_THEME, true))) {
+		Ref<EditorSettings> es = EditorInterface::get_singleton()->get_editor_settings();
+		if (es->has_setting("interface/theme/base_color")) {
+			args += " --godot-base " + Color(es->get_setting("interface/theme/base_color")).to_html(false);
+		}
+		if (es->has_setting("interface/theme/accent_color")) {
+			args += " --godot-accent " + Color(es->get_setting("interface/theme/accent_color")).to_html(false);
+		}
+	}
+	if (bool(_setting(S_KEEP_SPLASH, false))) {
+		args += " --godot-keep-splash";
+	}
 
 	std::wstring err;
 	popped_out = false;
@@ -432,6 +816,44 @@ void BlenderDockPlugin::_launch(const String &p_blend) {
 	_update_ui();
 }
 
+void BlenderDockPlugin::_launch_checked(const String &p_blend) {
+	if (FileAccess::file_exists(_recovery_path())) {
+		pending_launch_blend = p_blend;
+		if (selftest_step >= 0) {
+			UtilityFunctions::print("SELFTEST recovery file found -> recovering");
+			_on_recover_confirmed();
+			return;
+		}
+		recover_dialog->popup_centered();
+		return;
+	}
+	_launch(p_blend);
+}
+
+void BlenderDockPlugin::_on_recover_confirmed() {
+	// Never open the recovery file itself (it is deleted on Blender's clean exit): copy it into the project.
+	String stamp = Time::get_singleton()->get_datetime_string_from_system(false, true).replace(":", "-").replace(" ", "_");
+	ensure_ignored_dir("res://blender");
+	String dst = ProjectSettings::get_singleton()->globalize_path("res://blender").path_join("recovered_" + stamp + ".blend");
+	Error err = DirAccess::copy_absolute(_recovery_path(), dst);
+	if (err == OK) {
+		DirAccess::remove_absolute(_recovery_path());
+		DirAccess::remove_absolute(_recovery_path() + "1");
+		notice = "Recovered Blender work saved as res://blender/" + dst.get_file();
+		notice_time = Time::get_singleton()->get_ticks_msec() / 1000.0;
+		_launch(dst);
+	} else {
+		last_error = "Could not copy the recovery file; it is still at " + _recovery_path();
+		_launch(pending_launch_blend);
+	}
+}
+
+void BlenderDockPlugin::_on_recover_canceled() {
+	DirAccess::remove_absolute(_recovery_path());
+	DirAccess::remove_absolute(_recovery_path() + "1");
+	_launch(pending_launch_blend);
+}
+
 void BlenderDockPlugin::_on_launch_pressed() {
 	String blend = ProjectSettings::get_singleton()->get_setting(P_BLEND_FILE, String());
 	if (!blend.is_empty()) {
@@ -440,8 +862,7 @@ void BlenderDockPlugin::_on_launch_pressed() {
 			blend = "";
 		}
 	}
-	_launch(blend);
-	// Bring a Blender panel into view.
+	_launch_checked(blend);
 	if (!_active_host()) {
 		EditorInterface::get_singleton()->set_main_screen_editor("Blender");
 	}
@@ -461,7 +882,7 @@ void BlenderDockPlugin::_on_file_selected(const String &p_path) {
 		d["path"] = path;
 		link->send(d);
 	} else if (!embed->is_running()) {
-		_launch(path);
+		_launch_checked(path);
 	} else {
 		last_error = "Blender is running but the link is not connected yet; open the file from Blender.";
 	}
@@ -473,19 +894,80 @@ void BlenderDockPlugin::_on_popout_pressed() {
 	if (popped_out) {
 		embed->detach();
 	}
+	_send_chrome();
 	_update_ui();
 }
 
 void BlenderDockPlugin::_on_add_link_pressed() {
-	if (!link->add_to_edited_scene()) {
-		last_error = "Open a 3D scene (Node3D root) first.";
-	} else {
-		last_error = "";
-	}
+	last_error = link->add_to_edited_scene() ? String() : String("Open a 3D scene (Node3D root) first.");
+	_update_ui();
+}
+
+void BlenderDockPlugin::_on_bake_pressed() {
+	ensure_ignored_dir("res://blender"); // keep the folder layout predictable
+	Dictionary d;
+	d["t"] = "bake";
+	d["dir"] = ProjectSettings::get_singleton()->globalize_path("res://blender_assets");
+	link->send(d);
+	notice = "Baking Blender selection to glTF...";
+	notice_time = Time::get_singleton()->get_ticks_msec() / 1000.0;
 	_update_ui();
 }
 
 void BlenderDockPlugin::_on_sync_toggled(bool p_on) {
 	sync_enabled = p_on;
+	_update_ui();
+}
+
+void BlenderDockPlugin::_on_follow_toggled(bool p_on) {
+	follow_view = p_on;
+	last_view = Transform3D();
+	_update_ui();
+}
+
+void BlenderDockPlugin::_on_selection_changed() {
+	if (link.is_valid()) {
+		link->on_editor_selection_changed();
+	}
+}
+
+void BlenderDockPlugin::_on_settings_pressed() {
+	SettingsUI &s = settings;
+	s.path->set_text(_setting(S_BLENDER_PATH, String()));
+	s.port->set_value(int(_setting(S_PORT, 6789)));
+	s.recovery->set_value(int(_setting(S_RECOVERY, 30)));
+	s.auto_launch->set_pressed(_setting(S_AUTO_LAUNCH, false));
+	s.follow_mouse->set_pressed(_setting(S_FOLLOW_MOUSE, true));
+	s.theme->set_pressed(_setting(S_MATCH_THEME, true));
+	s.statusbar->set_pressed(_setting(S_HIDE_STATUSBAR, true));
+	s.splash->set_pressed(_setting(S_KEEP_SPLASH, false));
+	s.dialog->popup_centered();
+}
+
+void BlenderDockPlugin::_on_browse_blender() {
+	settings.browse->popup_file_dialog();
+}
+
+void BlenderDockPlugin::_on_blender_path_selected(const String &p_path) {
+	settings.path->set_text(p_path);
+}
+
+void BlenderDockPlugin::_on_settings_confirmed() {
+	SettingsUI &s = settings;
+	Ref<EditorSettings> es = EditorInterface::get_singleton()->get_editor_settings();
+	int old_port = _setting(S_PORT, 6789);
+	es->set_setting(S_BLENDER_PATH, s.path->get_text().strip_edges());
+	es->set_setting(S_PORT, int(s.port->get_value()));
+	es->set_setting(S_RECOVERY, int(s.recovery->get_value()));
+	es->set_setting(S_AUTO_LAUNCH, s.auto_launch->is_pressed());
+	es->set_setting(S_FOLLOW_MOUSE, s.follow_mouse->is_pressed());
+	es->set_setting(S_MATCH_THEME, s.theme->is_pressed());
+	es->set_setting(S_HIDE_STATUSBAR, s.statusbar->is_pressed());
+	es->set_setting(S_KEEP_SPLASH, s.splash->is_pressed());
+	if (int(s.port->get_value()) != old_port) {
+		link->start(int(s.port->get_value()));
+	}
+	notice = embed->is_running() ? String("Settings saved. Some apply the next time Blender starts.") : String("Settings saved.");
+	notice_time = Time::get_singleton()->get_ticks_msec() / 1000.0;
 	_update_ui();
 }

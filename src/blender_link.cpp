@@ -1,15 +1,26 @@
 #include "blender_link.h"
 
 #include <godot_cpp/classes/camera3d.hpp>
+#include <godot_cpp/classes/collision_shape3d.hpp>
 #include <godot_cpp/classes/directional_light3d.hpp>
+#include <godot_cpp/classes/editor_file_system.hpp>
 #include <godot_cpp/classes/editor_interface.hpp>
+#include <godot_cpp/classes/editor_selection.hpp>
+#include <godot_cpp/classes/file_access.hpp>
 #include <godot_cpp/classes/image.hpp>
 #include <godot_cpp/classes/image_texture.hpp>
 #include <godot_cpp/classes/json.hpp>
 #include <godot_cpp/classes/mesh.hpp>
 #include <godot_cpp/classes/mesh_instance3d.hpp>
+#include <godot_cpp/classes/multi_mesh.hpp>
+#include <godot_cpp/classes/multi_mesh_instance3d.hpp>
 #include <godot_cpp/classes/omni_light3d.hpp>
+#include <godot_cpp/classes/concave_polygon_shape3d.hpp>
+#include <godot_cpp/classes/convex_polygon_shape3d.hpp>
+#include <godot_cpp/classes/shape3d.hpp>
 #include <godot_cpp/classes/spot_light3d.hpp>
+#include <godot_cpp/classes/static_body3d.hpp>
+#include <godot_cpp/classes/time.hpp>
 #include <godot_cpp/core/object.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 
@@ -45,6 +56,48 @@ T *instance_from(uint64_t id) {
 	return id ? Object::cast_to<T>(ObjectDB::get_instance(ObjectID(id))) : nullptr;
 }
 
+uint64_t now_ms() {
+	return Time::get_singleton()->get_ticks_msec();
+}
+
+template <typename P, typename E>
+P read_packed(const uint8_t *&p, int64_t count, int64_t elem_size) {
+	P arr;
+	arr.resize(count);
+	memcpy(arr.ptrw(), p, count * elem_size);
+	p += count * elem_size;
+	return arr;
+}
+
+PackedFloat32Array xform_list(const Transform3D &t) {
+	PackedFloat32Array a;
+	a.resize(12);
+	float *w = a.ptrw();
+	for (int c = 0; c < 3; c++) {
+		Vector3 col = t.basis.get_column(c);
+		w[c * 3 + 0] = col.x;
+		w[c * 3 + 1] = col.y;
+		w[c * 3 + 2] = col.z;
+	}
+	w[9] = t.origin.x;
+	w[10] = t.origin.y;
+	w[11] = t.origin.z;
+	return a;
+}
+
+BaseMaterial3D::TextureChannel to_channel(const String &c) {
+	if (c == "r") {
+		return BaseMaterial3D::TEXTURE_CHANNEL_RED;
+	} else if (c == "g") {
+		return BaseMaterial3D::TEXTURE_CHANNEL_GREEN;
+	} else if (c == "b") {
+		return BaseMaterial3D::TEXTURE_CHANNEL_BLUE;
+	} else if (c == "a") {
+		return BaseMaterial3D::TEXTURE_CHANNEL_ALPHA;
+	}
+	return BaseMaterial3D::TEXTURE_CHANNEL_GRAYSCALE;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------- network
@@ -77,6 +130,18 @@ bool BlenderLink::is_peer_connected() const {
 	return peer.is_valid() && peer->get_status() == StreamPeerTCP::STATUS_CONNECTED;
 }
 
+bool BlenderLink::take_just_connected() {
+	bool v = just_connected;
+	just_connected = false;
+	return v;
+}
+
+String BlenderLink::take_notice() {
+	String n = notice;
+	notice = "";
+	return n;
+}
+
 void BlenderLink::send(const Dictionary &p_header) {
 	if (!is_peer_connected()) {
 		return;
@@ -93,6 +158,7 @@ void BlenderLink::send(const Dictionary &p_header) {
 }
 
 void BlenderLink::poll(bool p_sync_enabled) {
+	bool was_enabled = sync_enabled;
 	sync_enabled = p_sync_enabled;
 
 	if (server.is_valid() && server->is_connection_available()) {
@@ -105,6 +171,8 @@ void BlenderLink::poll(bool p_sync_enabled) {
 			peer->set_no_delay(true);
 			inbuf.clear();
 			inbuf_off = 0;
+			just_connected = true;
+			last_sel.clear();
 			Dictionary d;
 			d["t"] = "sync";
 			send(d);
@@ -121,11 +189,18 @@ void BlenderLink::poll(bool p_sync_enabled) {
 		}
 	}
 
-	// Follow the editor's current scene.
 	Node *root = EditorInterface::get_singleton()->get_edited_scene_root();
 	uint64_t rid = root ? uint64_t(root->get_instance_id()) : 0;
-	if (rid != bound_scene_id || (link_root_id && !instance_from<Node3D>(link_root_id))) {
+	if (rid != bound_scene_id || (link_root_id && !instance_from<Node3D>(link_root_id)) || (!was_enabled && sync_enabled)) {
 		_bind_scene();
+	}
+
+	if (!pending_parent.is_empty()) {
+		_resolve_parents();
+	}
+	if (!collision_dirty.is_empty() && now_ms() >= next_collision_ms) {
+		next_collision_ms = now_ms() + 300;
+		_refresh_collisions();
 	}
 
 	if (scene_changed) {
@@ -137,7 +212,6 @@ void BlenderLink::poll(bool p_sync_enabled) {
 }
 
 void BlenderLink::_read_peer() {
-	// Drain everything available this tick (bounded so a huge burst can't freeze the editor).
 	for (int guard = 0; guard < 64; guard++) {
 		int avail = peer->get_available_bytes();
 		if (avail <= 0) {
@@ -167,18 +241,15 @@ void BlenderLink::_read_peer() {
 			return;
 		}
 		if (size - inbuf_off - 4 < int64_t(frame_len)) {
-			break; // incomplete
+			break;
 		}
 		const uint8_t *f = data + inbuf_off + 4;
 		uint32_t hl = rd_u32(f);
-		if (hl > frame_len - 4) {
-			inbuf_off += 4 + frame_len;
-			continue;
-		}
-		String hs = String::utf8(reinterpret_cast<const char *>(f + 4), hl);
-		Variant hv = JSON::parse_string(hs);
-		if (hv.get_type() == Variant::DICTIONARY) {
-			_handle_frame(hv, f + 4 + hl, int64_t(frame_len) - 4 - hl);
+		if (hl <= frame_len - 4) {
+			Variant hv = JSON::parse_string(String::utf8(reinterpret_cast<const char *>(f + 4), hl));
+			if (hv.get_type() == Variant::DICTIONARY) {
+				_handle_frame(hv, f + 4 + hl, int64_t(frame_len) - 4 - hl);
+			}
 		}
 		inbuf_off += 4 + frame_len;
 	}
@@ -200,8 +271,22 @@ void BlenderLink::_handle_frame(const Dictionary &h, const uint8_t *blob, int64_
 		_on_mesh(h, blob, blob_len);
 	} else if (t == "mat") {
 		_on_material(h);
+	} else if (t == "coll") {
+		_on_collection(h);
+	} else if (t == "inst") {
+		_on_instances(h, blob, blob_len);
 	} else if (t == "scene") {
 		_on_scene(h);
+	} else if (t == "sel") {
+		_on_selection(h);
+	} else if (t == "baked") {
+		if (bool(h.get("ok", false))) {
+			notice = "Baked " + String(h.get("path", "")).get_file() + " into res://blender_assets";
+			EditorInterface::get_singleton()->get_resource_filesystem()->scan();
+		} else {
+			notice = "Bake failed: " + String(h.get("msg", "unknown error"));
+		}
+		UtilityFunctions::print("Blender Dock: ", notice);
 	} else if (t == "hello") {
 		blend_file = h.get("file", "");
 		UtilityFunctions::print("Blender Dock: linked to Blender ", h.get("blender", ""), " ",
@@ -209,7 +294,25 @@ void BlenderLink::_handle_frame(const Dictionary &h, const uint8_t *blob, int64_
 	}
 }
 
-// ---------------------------------------------------------------------------- data
+// ---------------------------------------------------------------------------- materials
+
+Ref<Texture2D> BlenderLink::_texture(const String &p_path) {
+	if (p_path.is_empty()) {
+		return Ref<Texture2D>();
+	}
+	String key = p_path + String("@") + itos(FileAccess::get_modified_time(p_path));
+	if (Ref<Texture2D> *t = textures.getptr(key)) {
+		return *t;
+	}
+	Ref<Image> img = Image::load_from_file(p_path);
+	Ref<Texture2D> tex;
+	if (img.is_valid() && !img->is_empty()) {
+		img->generate_mipmaps();
+		tex = ImageTexture::create_from_image(img);
+	}
+	textures[key] = tex;
+	return tex;
+}
 
 Ref<StandardMaterial3D> BlenderLink::_material(const String &p_name) {
 	if (p_name.is_empty()) {
@@ -232,17 +335,33 @@ void BlenderLink::_on_material(const Dictionary &h) {
 	}
 	Color c = to_color(h.get("color", Variant()));
 	m->set_albedo(c);
+	m->set_texture(BaseMaterial3D::TEXTURE_ALBEDO, _texture(h.get("texture", "")));
+	m->set_flag(BaseMaterial3D::FLAG_ALBEDO_FROM_VERTEX_COLOR, h.get("vertex_color", false));
 	m->set_metallic(h.get("metallic", 0.0));
 	m->set_roughness(h.get("roughness", 0.5));
 	m->set_specular(h.get("specular", 0.5));
 
+	Ref<Texture2D> rough = _texture(h.get("rough_tex", ""));
+	m->set_texture(BaseMaterial3D::TEXTURE_ROUGHNESS, rough);
+	m->set_roughness_texture_channel(to_channel(h.get("rough_ch", "")));
+	Ref<Texture2D> metal = _texture(h.get("metal_tex", ""));
+	m->set_texture(BaseMaterial3D::TEXTURE_METALLIC, metal);
+	m->set_metallic_texture_channel(to_channel(h.get("metal_ch", "")));
+
+	Ref<Texture2D> normal = _texture(h.get("normal_tex", ""));
+	m->set_feature(BaseMaterial3D::FEATURE_NORMAL_MAPPING, normal.is_valid());
+	m->set_texture(BaseMaterial3D::TEXTURE_NORMAL, normal);
+	m->set_normal_scale(h.get("normal_strength", 1.0));
+
 	Color e = to_color(h.get("emission", Variant()), Color(0, 0, 0));
 	double es = h.get("emission_strength", 0.0);
-	bool emit = es > 0.0 && (e.r + e.g + e.b) > 0.0;
+	Ref<Texture2D> etex = _texture(h.get("emission_tex", ""));
+	bool emit = es > 0.0 && ((e.r + e.g + e.b) > 0.0 || etex.is_valid());
 	m->set_feature(BaseMaterial3D::FEATURE_EMISSION, emit);
 	if (emit) {
 		m->set_emission(Color(e.r, e.g, e.b));
 		m->set_emission_energy_multiplier(es);
+		m->set_texture(BaseMaterial3D::TEXTURE_EMISSION, etex);
 	}
 
 	bool blend = h.get("alpha_blend", false);
@@ -250,86 +369,105 @@ void BlenderLink::_on_material(const Dictionary &h) {
 							  : (c.a < 0.999f ? BaseMaterial3D::TRANSPARENCY_ALPHA_DEPTH_PRE_PASS
 											  : BaseMaterial3D::TRANSPARENCY_DISABLED));
 	m->set_cull_mode(bool(h.get("double_sided", false)) ? BaseMaterial3D::CULL_DISABLED : BaseMaterial3D::CULL_BACK);
-
-	String tex = h.get("texture", "");
-	String *cur = material_textures.getptr(m->get_name());
-	if (!cur || *cur != tex) {
-		Ref<Texture2D> t;
-		if (!tex.is_empty()) {
-			Ref<Image> img = Image::load_from_file(tex);
-			if (img.is_valid() && !img->is_empty()) {
-				img->generate_mipmaps();
-				t = ImageTexture::create_from_image(img);
-			}
-		}
-		m->set_texture(BaseMaterial3D::TEXTURE_ALBEDO, t);
-		material_textures[m->get_name()] = tex;
-	}
 }
+
+// ---------------------------------------------------------------------------- meshes
 
 void BlenderLink::_on_mesh(const Dictionary &h, const uint8_t *blob, int64_t blob_len) {
 	String key = h.get("key", "");
 	if (key.is_empty()) {
 		return;
 	}
-	Ref<ArrayMesh> mesh;
-	if (Ref<ArrayMesh> *found = meshes.getptr(key)) {
-		mesh = *found;
-	} else {
-		mesh.instantiate();
-		mesh->set_name(key);
-		meshes[key] = mesh;
+	MeshCache &mc = meshes[key];
+	if (mc.mesh.is_null()) {
+		mc.mesh.instantiate();
+		mc.mesh->set_name(key.trim_prefix("inst:"));
 	}
-	mesh->clear_surfaces();
-
+	bool pos_only = h.get("pos_only", false);
 	Array surfaces = h.get("surfaces", Array());
+	if (pos_only && surfaces.size() != mc.surface_arrays.size()) {
+		Dictionary d;
+		d["t"] = "sync"; // cache mismatch (e.g. after a scene reload): ask for everything again
+		send(d);
+		return;
+	}
+
+	Vector<Array> new_arrays;
+	Vector<String> new_mats;
 	for (int i = 0; i < surfaces.size(); i++) {
 		Dictionary s = surfaces[i];
 		int64_t nv = int64_t(s.get("nv", 0));
 		int64_t ni = int64_t(s.get("ni", 0));
-		bool has_uv = s.get("uv", false);
 		int64_t off = int64_t(s.get("off", 0));
-		int64_t need = nv * 12 * 2 + (has_uv ? nv * 8 : 0) + ni * 4;
-		if (nv <= 0 || ni <= 0 || off < 0 || off + need > blob_len) {
+		int64_t len = int64_t(s.get("len", 0));
+		if (nv <= 0 || ni <= 0 || off < 0 || off + len > blob_len) {
 			continue;
 		}
 		const uint8_t *p = blob + off;
-
-		PackedVector3Array pos;
-		pos.resize(nv);
-		memcpy(pos.ptrw(), p, nv * 12);
-		p += nv * 12;
-		PackedVector3Array nrm;
-		nrm.resize(nv);
-		memcpy(nrm.ptrw(), p, nv * 12);
-		p += nv * 12;
-		PackedVector2Array uv;
-		if (has_uv) {
-			uv.resize(nv);
-			memcpy(uv.ptrw(), p, nv * 8);
-			p += nv * 8;
-		}
-		PackedInt32Array idx;
-		idx.resize(ni);
-		memcpy(idx.ptrw(), p, ni * 4);
+		bool has_tan = s.get("tan", false);
 
 		Array arrays;
-		arrays.resize(Mesh::ARRAY_MAX);
-		arrays[Mesh::ARRAY_VERTEX] = pos;
-		arrays[Mesh::ARRAY_NORMAL] = nrm;
-		if (has_uv) {
-			arrays[Mesh::ARRAY_TEX_UV] = uv;
+		if (pos_only) {
+			arrays = mc.surface_arrays[i].duplicate();
+			if (PackedVector3Array(arrays[Mesh::ARRAY_VERTEX]).size() != nv) {
+				Dictionary d;
+				d["t"] = "sync";
+				send(d);
+				return;
+			}
+		} else {
+			arrays.resize(Mesh::ARRAY_MAX);
 		}
-		arrays[Mesh::ARRAY_INDEX] = idx;
-		mesh->add_surface_from_arrays(Mesh::PRIMITIVE_TRIANGLES, arrays);
-		int si = mesh->get_surface_count() - 1;
-		Ref<StandardMaterial3D> mat = _material(s.get("mat", ""));
+		arrays[Mesh::ARRAY_VERTEX] = read_packed<PackedVector3Array, Vector3>(p, nv, 12);
+		arrays[Mesh::ARRAY_NORMAL] = read_packed<PackedVector3Array, Vector3>(p, nv, 12);
+		if (has_tan) {
+			arrays[Mesh::ARRAY_TANGENT] = read_packed<PackedFloat32Array, float>(p, nv * 4, 4);
+		}
+		if (!pos_only) {
+			if (bool(s.get("uv", false))) {
+				arrays[Mesh::ARRAY_TEX_UV] = read_packed<PackedVector2Array, Vector2>(p, nv, 8);
+			}
+			if (bool(s.get("uv2", false))) {
+				arrays[Mesh::ARRAY_TEX_UV2] = read_packed<PackedVector2Array, Vector2>(p, nv, 8);
+			}
+			if (bool(s.get("col", false))) {
+				arrays[Mesh::ARRAY_COLOR] = read_packed<PackedColorArray, Color>(p, nv, 16);
+			}
+			arrays[Mesh::ARRAY_INDEX] = read_packed<PackedInt32Array, int32_t>(p, ni, 4);
+			new_mats.push_back(s.get("mat", ""));
+		} else {
+			new_mats.push_back(mc.surface_mats[i]);
+		}
+		new_arrays.push_back(arrays);
+	}
+
+	mc.mesh->clear_surfaces();
+	for (int i = 0; i < new_arrays.size(); i++) {
+		mc.mesh->add_surface_from_arrays(Mesh::PRIMITIVE_TRIANGLES, new_arrays[i]);
+		Ref<StandardMaterial3D> mat = _material(new_mats[i]);
 		if (mat.is_valid()) {
-			mesh->surface_set_material(si, mat);
+			mc.mesh->surface_set_material(i, mat);
+		}
+	}
+	mc.surface_arrays = new_arrays;
+	mc.surface_mats = new_mats;
+	mc.revision++;
+
+	// Collisions built from this mesh need regenerating; instances need the mesh hooked up.
+	for (const KeyValue<String, uint64_t> &kv : nodes) {
+		if (kv.key.begins_with("o:") && kv.key.substr(2) == key) {
+			collision_dirty.insert(kv.key);
+		}
+	}
+	for (const KeyValue<String, String> &kv : instance_mesh) {
+		if (kv.value == key) {
+			_apply_instances(kv.key);
 		}
 	}
 	scene_changed = true;
 }
+
+// ---------------------------------------------------------------------------- objects / collections / instances
 
 void BlenderLink::_on_object(const Dictionary &h) {
 	String name = h.get("name", "");
@@ -340,31 +478,83 @@ void BlenderLink::_on_object(const Dictionary &h) {
 	_apply_object(name, h);
 }
 
-void BlenderLink::_on_scene(const Dictionary &h) {
-	Array list = h.get("objects", Array());
-	Dictionary keep;
-	for (int i = 0; i < list.size(); i++) {
-		keep[list[i]] = true;
+void BlenderLink::_on_collection(const Dictionary &h) {
+	String name = h.get("name", "");
+	if (name.is_empty()) {
+		return;
 	}
+	collections[name] = h;
+	_apply_collection(name, h);
+}
+
+void BlenderLink::_on_instances(const Dictionary &h, const uint8_t *blob, int64_t blob_len) {
+	String key = h.get("key", "");
+	int64_t count = int64_t(h.get("count", 0));
+	if (key.is_empty() || count < 0 || count * 48 > blob_len) {
+		return;
+	}
+	PackedFloat32Array buf;
+	buf.resize(count * 12);
+	memcpy(buf.ptrw(), blob, count * 48);
+	instance_xforms[key] = buf;
+	instance_mesh[key] = h.get("mesh", "");
+	_apply_instances(key);
+}
+
+void BlenderLink::_on_scene(const Dictionary &h) {
+	auto to_set = [](const Array &a) {
+		HashSet<String> s;
+		for (int i = 0; i < a.size(); i++) {
+			s.insert(a[i]);
+		}
+		return s;
+	};
+	HashSet<String> keep_obj = to_set(h.get("objects", Array()));
+	HashSet<String> keep_col = to_set(h.get("collections", Array()));
+
 	Array names = objects.keys();
 	for (int i = 0; i < names.size(); i++) {
-		String n = names[i];
-		if (!keep.has(n)) {
-			objects.erase(n);
-			_remove_object_node(n);
+		if (!keep_obj.has(names[i])) {
+			objects.erase(names[i]);
+			_remove_node("o:" + String(names[i]));
 		}
 	}
+	names = collections.keys();
+	for (int i = 0; i < names.size(); i++) {
+		if (!keep_col.has(names[i])) {
+			collections.erase(names[i]);
+			_remove_node("c:" + String(names[i]));
+		}
+	}
+	if (h.has("instances")) {
+		HashSet<String> keep_inst = to_set(h["instances"]);
+		Vector<String> dead;
+		for (const KeyValue<String, PackedFloat32Array> &kv : instance_xforms) {
+			if (!keep_inst.has(kv.key)) {
+				dead.push_back(kv.key);
+			}
+		}
+		for (const String &k : dead) {
+			instance_xforms.erase(k);
+			instance_mesh.erase(k);
+			_remove_node("i:" + k);
+		}
+	}
+
 	// Drop meshes nobody references any more.
-	Dictionary used;
+	HashSet<String> used;
 	Array vals = objects.values();
 	for (int i = 0; i < vals.size(); i++) {
 		Dictionary o = vals[i];
 		if (o.has("mesh")) {
-			used[o["mesh"]] = true;
+			used.insert(o["mesh"]);
 		}
 	}
+	for (const KeyValue<String, String> &kv : instance_mesh) {
+		used.insert(kv.value);
+	}
 	Vector<String> dead;
-	for (const KeyValue<String, Ref<ArrayMesh>> &kv : meshes) {
+	for (const KeyValue<String, MeshCache> &kv : meshes) {
 		if (!used.has(kv.key)) {
 			dead.push_back(kv.key);
 		}
@@ -372,16 +562,100 @@ void BlenderLink::_on_scene(const Dictionary &h) {
 	for (const String &k : dead) {
 		meshes.erase(k);
 	}
-	if (objects.size() != last_reported) {
-		last_reported = objects.size();
-		PackedStringArray in_scene;
-		for (const KeyValue<String, uint64_t> &kv : nodes) {
-			if (Node3D *n = instance_from<Node3D>(kv.value)) {
-				in_scene.push_back(String(n->get_name()) + "(" + n->get_class() + ")");
+
+	String summary = vformat("%d objects, %d collections, %d instance groups, %d meshes", objects.size(),
+			collections.size(), (int)instance_xforms.size(), (int)meshes.size());
+	if (summary != last_summary) {
+		last_summary = summary;
+		UtilityFunctions::print("Blender Dock: ", summary);
+	}
+}
+
+void BlenderLink::_on_selection(const Dictionary &h) {
+	PackedStringArray names = PackedStringArray(Array(h.get("names", Array())));
+	names.sort();
+	if (names == last_sel || !instance_from<Node3D>(link_root_id)) {
+		last_sel = names;
+		return;
+	}
+	last_sel = names;
+	EditorSelection *es = EditorInterface::get_singleton()->get_selection();
+	es->clear();
+	String active = h.get("active", "");
+	Node *active_node = nullptr;
+	for (const String &n : names) {
+		Node3D *node = _node("o:" + n);
+		if (node) {
+			es->add_node(node);
+			if (n == active) {
+				active_node = node;
 			}
 		}
-		UtilityFunctions::print("Blender Dock: ", objects.size(), " Blender objects, ", meshes.size(),
-				" meshes; in scene: ", String(", ").join(in_scene));
+	}
+	if (active_node) {
+		// inspect_object (not edit_node): updates the Inspector without switching main screens.
+		EditorInterface::get_singleton()->inspect_object(active_node, "", true);
+	}
+}
+
+// ---------------------------------------------------------------------------- two-way (Godot -> Blender)
+
+void BlenderLink::on_editor_selection_changed() {
+	Node3D *lr = instance_from<Node3D>(link_root_id);
+	if (!lr || !is_peer_connected()) {
+		return;
+	}
+	TypedArray<Node> sel = EditorInterface::get_singleton()->get_selection()->get_selected_nodes();
+	PackedStringArray names;
+	for (int i = 0; i < sel.size(); i++) {
+		Node *n = Object::cast_to<Node>(sel[i]);
+		if (n && n->has_meta(NAME_META)) {
+			String key = n->get_meta(NAME_META);
+			if (key.begins_with("o:")) {
+				names.push_back(key.substr(2));
+			}
+		}
+	}
+	names.sort();
+	if (names == last_sel) {
+		return;
+	}
+	last_sel = names;
+	Dictionary d;
+	d["t"] = "sel";
+	d["names"] = names;
+	d["active"] = names.size() == 1 ? names[0] : String();
+	send(d);
+}
+
+void BlenderLink::watch_selected_transforms() {
+	Node3D *lr = instance_from<Node3D>(link_root_id);
+	if (!lr || !is_peer_connected() || now_ms() < next_xform_ms) {
+		return;
+	}
+	next_xform_ms = now_ms() + 33;
+	TypedArray<Node> sel = EditorInterface::get_singleton()->get_selection()->get_selected_nodes();
+	for (int i = 0; i < sel.size(); i++) {
+		Node3D *n = Object::cast_to<Node3D>(sel[i]);
+		if (!n || !n->has_meta(NAME_META) || !n->is_inside_tree()) {
+			continue;
+		}
+		String key = n->get_meta(NAME_META);
+		if (!key.begins_with("o:")) {
+			continue;
+		}
+		Transform3D local = n->get_transform();
+		Transform3D *applied = applied_xform.getptr(key);
+		if (applied && applied->is_equal_approx(local)) {
+			continue;
+		}
+		applied_xform[key] = local;
+		local_edit_until[key] = now_ms() + 400;
+		Dictionary d;
+		d["t"] = "xform";
+		d["name"] = key.substr(2);
+		d["xform"] = xform_list(lr->get_global_transform().affine_inverse() * n->get_global_transform());
+		send(d);
 	}
 }
 
@@ -399,6 +673,10 @@ Node3D *BlenderLink::_find_link_root() {
 		}
 	}
 	return nullptr;
+}
+
+Node3D *BlenderLink::get_link_root() {
+	return instance_from<Node3D>(link_root_id);
 }
 
 bool BlenderLink::edited_scene_has_link() {
@@ -422,51 +700,262 @@ bool BlenderLink::add_to_edited_scene() {
 	return true;
 }
 
+Node3D *BlenderLink::_node(const String &p_key) {
+	uint64_t *id = nodes.getptr(p_key);
+	return id ? instance_from<Node3D>(*id) : nullptr;
+}
+
+void BlenderLink::_own_recursive(Node *p_node, Node *p_owner) {
+	if (p_node != p_owner) {
+		p_node->set_owner(p_owner);
+	}
+	for (int i = 0; i < p_node->get_child_count(); i++) {
+		_own_recursive(p_node->get_child(i), p_owner);
+	}
+}
+
 void BlenderLink::_bind_scene() {
 	Node *root = EditorInterface::get_singleton()->get_edited_scene_root();
 	bound_scene_id = root ? uint64_t(root->get_instance_id()) : 0;
 	nodes.clear();
+	pending_parent.clear();
+	applied_xform.clear();
 	Node3D *lr = _find_link_root();
 	link_root_id = lr ? uint64_t(lr->get_instance_id()) : 0;
 	if (!lr) {
 		return;
 	}
-	for (int i = 0; i < lr->get_child_count(); i++) {
-		Node3D *n = Object::cast_to<Node3D>(lr->get_child(i));
-		if (n && n->has_meta(NAME_META)) {
-			nodes[String(n->get_meta(NAME_META))] = uint64_t(n->get_instance_id());
+	// Index existing nodes (saved scenes), anywhere below the link root.
+	Vector<Node *> stack;
+	stack.push_back(lr);
+	while (!stack.is_empty()) {
+		Node *n = stack[stack.size() - 1];
+		stack.remove_at(stack.size() - 1);
+		for (int i = 0; i < n->get_child_count(); i++) {
+			Node *c = n->get_child(i);
+			if (Node3D *c3 = Object::cast_to<Node3D>(c)) {
+				if (c3->has_meta(NAME_META)) {
+					String key = c3->get_meta(NAME_META);
+					if (key.find(":") != 1) {
+						key = "o:" + key; // scenes saved by the first version
+						c3->set_meta(NAME_META, key);
+					}
+					nodes[key] = uint64_t(c3->get_instance_id());
+				}
+			}
+			stack.push_back(c);
 		}
 	}
 	if (!sync_enabled) {
 		return;
 	}
-	// Bring this scene up to date with everything we know.
-	Array names = objects.keys();
+	Array names = collections.keys();
+	for (int i = 0; i < names.size(); i++) {
+		_apply_collection(names[i], collections[names[i]]);
+	}
+	names = objects.keys();
 	for (int i = 0; i < names.size(); i++) {
 		_apply_object(names[i], objects[names[i]]);
 	}
+	for (const KeyValue<String, PackedFloat32Array> &kv : instance_xforms) {
+		_apply_instances(kv.key);
+	}
 	Vector<String> stale;
 	for (const KeyValue<String, uint64_t> &kv : nodes) {
-		if (!objects.has(kv.key)) {
+		String rest = kv.key.substr(2);
+		bool alive = (kv.key.begins_with("o:") && objects.has(rest)) || (kv.key.begins_with("c:") && collections.has(rest)) ||
+				(kv.key.begins_with("i:") && instance_xforms.has(rest));
+		if (!alive && (objects.size() || collections.size())) {
 			stale.push_back(kv.key);
 		}
 	}
-	for (const String &n : stale) {
-		_remove_object_node(n);
+	for (const String &k : stale) {
+		_remove_node(k);
 	}
 }
 
-void BlenderLink::_remove_object_node(const String &p_name) {
-	uint64_t *id = nodes.getptr(p_name);
+void BlenderLink::_remove_node(const String &p_key) {
+	uint64_t *id = nodes.getptr(p_key);
 	if (!id) {
 		return;
 	}
-	if (Node *n = instance_from<Node>(*id)) {
-		n->get_parent()->remove_child(n);
-		n->queue_free();
-		scene_changed = true;
+	Node3D *n = instance_from<Node3D>(*id);
+	nodes.erase(p_key);
+	applied_xform.erase(p_key);
+	if (!n) {
+		return;
 	}
-	nodes.erase(p_name);
+	// Rescue linked children (they may just be moving to another parent).
+	Node3D *lr = instance_from<Node3D>(link_root_id);
+	for (int i = n->get_child_count() - 1; i >= 0; i--) {
+		Node3D *c = Object::cast_to<Node3D>(n->get_child(i));
+		if (c && c->has_meta(NAME_META) && lr) {
+			c->reparent(lr, false);
+			_own_recursive(c, lr->get_owner() ? lr->get_owner() : lr);
+		}
+	}
+	n->get_parent()->remove_child(n);
+	n->queue_free();
+	scene_changed = true;
+}
+
+void BlenderLink::_place(Node3D *p_node, const String &p_parent_key, const String &p_key) {
+	Node3D *lr = instance_from<Node3D>(link_root_id);
+	Node3D *target = p_parent_key.is_empty() ? lr : _node(p_parent_key);
+	if (!target) {
+		target = lr;
+		pending_parent[p_key] = p_parent_key;
+	} else {
+		pending_parent.erase(p_key);
+	}
+	Node *scene_root = EditorInterface::get_singleton()->get_edited_scene_root();
+	if (!p_node->get_parent()) {
+		target->add_child(p_node, true);
+		_own_recursive(p_node, scene_root);
+	} else if (p_node->get_parent() != target) {
+		p_node->reparent(target, false);
+		_own_recursive(p_node, scene_root);
+	}
+}
+
+void BlenderLink::_resolve_parents() {
+	Vector<String> keys;
+	for (const KeyValue<String, String> &kv : pending_parent) {
+		if (_node(kv.value)) {
+			keys.push_back(kv.key);
+		}
+	}
+	for (const String &k : keys) {
+		String rest = k.substr(2);
+		if (k.begins_with("o:") && objects.has(rest)) {
+			_apply_object(rest, objects[rest]);
+		} else if (k.begins_with("c:") && collections.has(rest)) {
+			_apply_collection(rest, collections[rest]);
+		} else {
+			pending_parent.erase(k);
+		}
+	}
+}
+
+void BlenderLink::_apply_collection(const String &p_name, const Dictionary &h) {
+	if (!sync_enabled || !instance_from<Node3D>(link_root_id)) {
+		return;
+	}
+	String key = "c:" + p_name;
+	Node3D *node = _node(key);
+	if (!node) {
+		node = memnew(Node3D);
+		node->set_name(p_name.validate_node_name());
+		node->set_meta(NAME_META, key);
+		nodes[key] = uint64_t(node->get_instance_id());
+	}
+	_place(node, h.get("parent", ""), key);
+	node->set_visible(h.get("visible", true));
+}
+
+void BlenderLink::_apply_instances(const String &p_key) {
+	if (!sync_enabled || !instance_from<Node3D>(link_root_id)) {
+		return;
+	}
+	PackedFloat32Array *buf = instance_xforms.getptr(p_key);
+	if (!buf) {
+		return;
+	}
+	String key = "i:" + p_key;
+	MultiMeshInstance3D *mmi = Object::cast_to<MultiMeshInstance3D>(_node(key));
+	if (!mmi) {
+		mmi = memnew(MultiMeshInstance3D);
+		mmi->set_name(("Instances " + p_key.replace("/", " ")).validate_node_name());
+		mmi->set_meta(NAME_META, key);
+		nodes[key] = uint64_t(mmi->get_instance_id());
+		_place(mmi, "", key);
+	}
+	Ref<MultiMesh> mm = mmi->get_multimesh();
+	if (mm.is_null()) {
+		mm.instantiate();
+		mm->set_transform_format(MultiMesh::TRANSFORM_3D);
+		mmi->set_multimesh(mm);
+	}
+	MeshCache *mc = meshes.getptr(instance_mesh[p_key]);
+	Ref<Mesh> mesh = mc ? Ref<Mesh>(mc->mesh) : Ref<Mesh>();
+	if (mm->get_mesh() != mesh) {
+		mm->set_mesh(mesh);
+	}
+	int count = buf->size() / 12;
+	if (mm->get_instance_count() != count) {
+		mm->set_instance_count(count);
+	}
+	if (count > 0) {
+		mm->set_buffer(*buf);
+	}
+	scene_changed = true;
+}
+
+void BlenderLink::_update_collision(Node3D *p_node, const String &p_key, const Dictionary &h) {
+	String kind = h.get("col", "");
+	StaticBody3D *body = nullptr;
+	for (int i = 0; i < p_node->get_child_count(); i++) {
+		body = Object::cast_to<StaticBody3D>(p_node->get_child(i));
+		if (body && body->has_meta("blender_collision")) {
+			break;
+		}
+		body = nullptr;
+	}
+	if (kind.is_empty() || kind == "none") {
+		if (body) {
+			p_node->remove_child(body);
+			body->queue_free();
+			collision_rev.erase(p_key);
+		}
+		return;
+	}
+	MeshCache *mc = meshes.getptr(h.get("mesh", ""));
+	if (!mc || mc->mesh.is_null() || mc->mesh->get_surface_count() == 0) {
+		return;
+	}
+	String kind_key = p_key + String("#") + kind;
+	uint64_t *rev = collision_rev.getptr(kind_key);
+	if (body && rev && *rev == mc->revision) {
+		return;
+	}
+	Ref<Shape3D> shape = kind == "convex" ? Ref<Shape3D>(mc->mesh->create_convex_shape(true, false))
+										  : Ref<Shape3D>(mc->mesh->create_trimesh_shape());
+	if (shape.is_null()) {
+		return;
+	}
+	Node *scene_root = EditorInterface::get_singleton()->get_edited_scene_root();
+	if (!body) {
+		body = memnew(StaticBody3D);
+		body->set_name("Collision");
+		body->set_meta("blender_collision", true);
+		CollisionShape3D *cs = memnew(CollisionShape3D);
+		cs->set_name("Shape");
+		body->add_child(cs);
+		p_node->add_child(body);
+		_own_recursive(body, scene_root);
+		body->set_owner(scene_root);
+	}
+	CollisionShape3D *cs = Object::cast_to<CollisionShape3D>(body->get_child(0));
+	if (cs) {
+		cs->set_shape(shape);
+	}
+	collision_rev[kind_key] = mc->revision;
+	scene_changed = true;
+}
+
+void BlenderLink::_refresh_collisions() {
+	Vector<String> keys;
+	for (const String &k : collision_dirty) {
+		keys.push_back(k);
+	}
+	collision_dirty.clear();
+	for (const String &k : keys) {
+		Node3D *n = _node(k);
+		String name = k.substr(2);
+		if (n && objects.has(name)) {
+			_update_collision(n, k, objects[name]);
+		}
+	}
 }
 
 void BlenderLink::_apply_object(const String &p_name, const Dictionary &h) {
@@ -477,17 +966,15 @@ void BlenderLink::_apply_object(const String &p_name, const Dictionary &h) {
 	if (!lr) {
 		return;
 	}
-	Node *scene_root = EditorInterface::get_singleton()->get_edited_scene_root();
+	String key = "o:" + p_name;
 	String kind = h.get("kind", "empty");
 
-	Node3D *node = nullptr;
-	if (uint64_t *id = nodes.getptr(p_name)) {
-		node = instance_from<Node3D>(*id);
-		if (node && String(node->get_meta("blender_kind", "")) != kind) {
-			_remove_object_node(p_name);
-			node = nullptr;
-		}
+	Node3D *node = _node(key);
+	if (node && String(node->get_meta("blender_kind", "")) != kind) {
+		_remove_node(key);
+		node = nullptr;
 	}
+	bool created = false;
 	if (!node) {
 		if (kind == "mesh") {
 			node = memnew(MeshInstance3D);
@@ -503,29 +990,33 @@ void BlenderLink::_apply_object(const String &p_name, const Dictionary &h) {
 			node = memnew(Node3D);
 		}
 		node->set_name(p_name.validate_node_name());
-		node->set_meta(NAME_META, p_name);
+		node->set_meta(NAME_META, key);
 		node->set_meta("blender_kind", kind);
-		lr->add_child(node, true);
-		node->set_owner(scene_root);
-		nodes[p_name] = uint64_t(node->get_instance_id());
+		nodes[key] = uint64_t(node->get_instance_id());
+		created = true;
 	}
+	_place(node, h.get("parent", ""), key);
 
+	uint64_t *until = local_edit_until.getptr(key);
+	bool godot_editing = until && now_ms() < *until;
 	Array x = h.get("xform", Array());
-	if (x.size() == 12) {
+	if (x.size() == 12 && !godot_editing) {
 		Basis b(Vector3(x[0], x[1], x[2]), Vector3(x[3], x[4], x[5]), Vector3(x[6], x[7], x[8]));
-		node->set_transform(Transform3D(b, Vector3(x[9], x[10], x[11])));
+		Transform3D t(b, Vector3(x[9], x[10], x[11]));
+		node->set_transform(t);
+		applied_xform[key] = t;
 	}
 	node->set_visible(h.get("visible", true));
 
 	if (MeshInstance3D *mi = Object::cast_to<MeshInstance3D>(node)) {
-		String key = h.get("mesh", "");
-		Ref<ArrayMesh> *m = meshes.getptr(key);
-		Ref<Mesh> want = m ? Ref<Mesh>(*m) : Ref<Mesh>();
+		MeshCache *mc = meshes.getptr(h.get("mesh", ""));
+		Ref<Mesh> want = (mc && !bool(h.get("colonly", false))) ? Ref<Mesh>(mc->mesh) : Ref<Mesh>();
 		if (mi->get_mesh() != want) {
 			mi->set_mesh(want);
 		}
 		mi->set_cast_shadows_setting(bool(h.get("shadow", true)) ? GeometryInstance3D::SHADOW_CASTING_SETTING_ON
 																  : GeometryInstance3D::SHADOW_CASTING_SETTING_OFF);
+		collision_dirty.insert(key);
 	} else if (Light3D *l = Object::cast_to<Light3D>(node)) {
 		l->set_color(to_color(h.get("color", Variant())));
 		l->set_param(Light3D::PARAM_ENERGY, h.get("energy", 1.0));
@@ -549,5 +1040,6 @@ void BlenderLink::_apply_object(const String &p_name, const Dictionary &h) {
 		c->set_near(h.get("near", 0.05));
 		c->set_far(h.get("far", 1000.0));
 	}
+	(void)created;
 	scene_changed = true;
 }

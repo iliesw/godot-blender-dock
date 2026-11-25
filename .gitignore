@@ -8,3 +8,5 @@ tests/*.png
 tests/*.log
 extension_api.json
 *.pyc
+tests/sandbox/
+~*.dll
